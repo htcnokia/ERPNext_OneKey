@@ -1,367 +1,355 @@
 #!/bin/bash
-
-# Official Frappe Docker Deployment Script (with Custom Image Build Support)
-set -e
+set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 
-# 修复：正确加载环境变量文件
+# 仅此一次即可
+if [[ -f "$ENV_FILE" ]]; then
+    set -a          # 自动导出
+    # 去掉 Windows 行尾 ^M 再加载
+    sed -e 's/\r$//' "$ENV_FILE" > /tmp/.env.unix
+    source /tmp/.env.unix
+    rm -f /tmp/.env.unix
+    set +a
+else
+    echo >&2 "ERROR: $ENV_FILE not found"
+    exit 1
+fi
+	
+# ---------- Logging ----------
+info()  { echo -e "\033[1;32m[INFO]\033[0m  $*"; }
+warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
+error() { echo -e "\033[1;31m[ERROR]\033[0m $*"; }
+
+# ---------- Load env and defaults ----------
 if [ -f "$ENV_FILE" ]; then
-    export $(grep -v '^#' "$ENV_FILE" | xargs)
+    # shellcheck disable=SC1090
+    set -o allexport
+    # Use a robust way to load env lines (ignore comments/blank)
+    # Avoid word splitting issues
+    awk -F= '/^[A-Za-z0-9_]+=/{print $0}' "$ENV_FILE" | sed 's/\r//g' | while IFS= read -r line; do
+        # export line preserving equals and value
+        eval "export $line"
+    done
+    set +o allexport
+else
+    error ".env not found in ${PROJECT_DIR}"
+    exit 1
 fi
 
-export CUSTOM_IMAGE=my-erpnext-v15-custom
-export CUSTOM_TAG=latest
-export BASE_TAG=${ERPNEXT_VERSION}
-export SITE_NAME=${SITES}
+# defaults (if .env lacks them)
+BASE_TAG=${ERPNEXT_VERSION:-v15.81.1}
+CUSTOM_IMAGE=${CUSTOM_IMAGE:-my-erpnext-v15-custom}
+CUSTOM_TAG=${CUSTOM_TAG:-latest}
+SITE_NAME=${SITES:-nexterp}
+COMPOSE_FILES_DEFAULT="-f compose.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-
-check_files() {
-    log_info "Checking required files..."
-    if [ ! -f "$ENV_FILE" ]; then
-        log_error "Environment file not found: $ENV_FILE"
-        log_info "Creating from example.env..."
-        cp example.env .env
-        log_warning "Please edit .env file with your configuration before deploying"
-        exit 1
+# If overrides/compose.custom.yaml exists, include it
+get_compose_files() {
+    if [ -f "overrides/compose.custom.yaml" ]; then
+        echo "-f compose.yaml -f overrides/compose.custom.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
+    else
+        echo "${COMPOSE_FILES_DEFAULT}"
     fi
-    if [ ! -f "compose.yaml" ]; then
-        log_error "compose.yaml not found in current directory"
-        exit 1
-    fi
-    log_info "Required files check passed ✅"
 }
 
-# ---- Custom Image Builder ----
+# ---------- Cleanup helpers ----------
+cleanup_tmp() {
+    [ -f Dockerfile.custom ] && rm -f Dockerfile.custom
+    [ -f overrides/compose.custom.yaml ] && rm -f overrides/compose.custom.yaml
+}
+trap cleanup_tmp EXIT
+
+# ---------- Generate Dockerfile.custom (gameplan commented out) ----------
 generate_custom_dockerfile() {
-    log_info "Generating Dockerfile.custom..."
-    
-    # 修复：添加 ARG 声明和创建必要的配置文件
+    info "Generating Dockerfile.custom (gameplan is commented out)..."
     cat > Dockerfile.custom <<EOF
 ARG BASE_TAG=${BASE_TAG}
 FROM frappe/erpnext:\${BASE_TAG}
 
 USER root
-#安装编译依赖
-RUN apt-get update && apt-get install -y git \
-    pkg-config \
-    mariadb-client \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git pkg-config mariadb-client curl unzip && rm -rf /var/lib/apt/lists/*
 USER frappe
 WORKDIR /home/frappe/frappe-bench
 
-# 创建必要的配置文件目录和文件
-RUN mkdir -p sites && \\
-    echo '{}' > sites/common_site_config.json && \\
-    echo '{"socketio_port": 9000}' > sites/common_site_config.json
+# ensure sites folder and minimal config exist
+RUN mkdir -p sites && echo '{}' > sites/common_site_config.json && echo '{"socketio_port":9000}' > sites/common_site_config.json
 
-# 安装应用并构建资源
-RUN bench get-app --branch develop https://github.com/frappe/telephony --skip-assets && \\
-    bench get-app --branch version-15 https://github.com/frappe/hrms --skip-assets && \\
-    bench get-app --branch main https://github.com/frappe/helpdesk --skip-assets && \\
-    bench get-app --branch main https://github.com/frappe/print_designer --skip-assets && \\
-    bench get-app --branch version-3 https://github.com/frappe/insights --skip-assets && \\
-    bench get-app --branch main https://github.com/frappe/drive --skip-assets
-	
-# 分别构建每个应用以避免内存问题
+# Download / get apps 
+RUN bench get-app --branch develop https://github.com/frappe/telephony --skip-assets || true && \
+    bench get-app --branch version-15 https://github.com/frappe/hrms --skip-assets || true && \
+    bench get-app --branch main https://github.com/frappe/helpdesk --skip-assets || true && \
+    bench get-app --branch main https://github.com/frappe/print_designer --skip-assets || true && \
+    bench get-app --branch version-3 https://github.com/frappe/insights --skip-assets || true && \
+    bench get-app --branch main https://github.com/frappe/drive --skip-assets || true && \
+    bench get-app --branch develop https://github.com/frappe/gameplan --skip-assets || true
+
+# Build apps individually to reduce peak memory usage
 RUN bench build --app frappe || true
-RUN bench build --app erpnext || true  
-
+RUN bench build --app erpnext || true
 RUN bench build --app telephony || true
 RUN bench build --app print_designer || true
 RUN bench build --app helpdesk || true
 RUN bench build --app insights || true
 RUN bench build --app drive || true
+RUN bench build --app gameplan || true
 
-# RUN bench --site "$SITE_NAME" install-app telephony || log_warning "$app may already be installed or failed to install"
-# RUN bench --site "$SITE_NAME" install-app print_designer || log_warning "$app may already be installed or failed to install"
-# RUN bench --site "$SITE_NAME" install-app helpdesk || log_warning "$app may already be installed or failed to install"
-# RUN bench --site "$SITE_NAME" install-app insights || log_warning "$app may already be installed or failed to install"
-# RUN bench --site "$SITE_NAME" install-app drive || log_warning "$app may already be installed or failed to install"
-# RUN bench --site "$SITE_NAME" migrate
-
-
-# 最后进行完整构建（如果前面的单独构建失败）
-RUN bench build || echo "Some apps may have build issues, but continuing..."
-
+# Final full build as last resort
+RUN bench build || echo "bench build completed with possible non-fatal errors"
 EOF
 }
 
+# ---------- Build custom image ----------
 build_custom_image() {
+    info "Building custom image ${CUSTOM_IMAGE}:${CUSTOM_TAG} with BASE_TAG=${BASE_TAG} ..."
     generate_custom_dockerfile
-    log_info "Building custom image..."
 
-    # 使用构建参数传递基础镜像标签
-    docker build --build-arg BASE_TAG=${BASE_TAG} -t ${CUSTOM_IMAGE}:${CUSTOM_TAG} -f Dockerfile.custom .
-    
-    if [ $? -eq 0 ]; then
-        log_info "Custom image built successfully: $CUSTOM_IMAGE:$CUSTOM_TAG ✅"
-        
-        # 更新 .env 文件以使用自定义镜像
-        if [ -f "$ENV_FILE" ]; then
-            # 备份原始文件
-            cp "$ENV_FILE" "$ENV_FILE.backup"
-            
-            # 更新或添加自定义镜像配置
-            if grep -q "CUSTOM_IMAGE" "$ENV_FILE"; then
-                sed -i "s/CUSTOM_IMAGE=.*/CUSTOM_IMAGE=${CUSTOM_IMAGE}/" "$ENV_FILE"
-            else
-                echo "CUSTOM_IMAGE=${CUSTOM_IMAGE}" >> "$ENV_FILE"
-            fi
-            
-            if grep -q "CUSTOM_TAG" "$ENV_FILE"; then
-                sed -i "s/CUSTOM_TAG=.*/CUSTOM_TAG=${CUSTOM_TAG}/" "$ENV_FILE"
-            else
-                echo "CUSTOM_TAG=${CUSTOM_TAG}" >> "$ENV_FILE"
-            fi
-            
-            log_info "Updated .env file with custom image configuration"
-        fi
+    docker build --build-arg BASE_TAG="${BASE_TAG}" -t "${CUSTOM_IMAGE}:${CUSTOM_TAG}" -f Dockerfile.custom .
+
+    info "Built image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}"
+    # update .env to persist custom image usage if desired
+    if grep -q '^CUSTOM_IMAGE=' "$ENV_FILE"; then
+        sed -i "s|^CUSTOM_IMAGE=.*|CUSTOM_IMAGE=${CUSTOM_IMAGE}|" "$ENV_FILE"
     else
-        log_error "Custom image build failed!"
-        exit 1
+        echo "CUSTOM_IMAGE=${CUSTOM_IMAGE}" >> "$ENV_FILE"
+    fi
+    if grep -q '^CUSTOM_TAG=' "$ENV_FILE"; then
+        sed -i "s|^CUSTOM_TAG=.*|CUSTOM_TAG=${CUSTOM_TAG}|" "$ENV_FILE"
+    else
+        echo "CUSTOM_TAG=${CUSTOM_TAG}" >> "$ENV_FILE"
     fi
 }
 
-deploy() {
-    check_files
-    if [ -f .env ]; then
-        export $(grep -v '^#' .env | xargs)
-    fi
-	
-    if [ "${BUILD_CUSTOM_IMAGE}" = "true" ]; then
-        build_custom_image
-    fi
-    
-    log_info "Deploying with official compose.yaml + overrides..."
-    
-    # 根据是否使用自定义镜像选择不同的 compose 配置
-    if [ -n "${CUSTOM_IMAGE}" ] && docker images "${CUSTOM_IMAGE}:${CUSTOM_TAG}" &> /dev/null; then
-        log_info "Using custom image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}"
-        # 创建 overrides 目录下的自定义镜像配置文件
-        mkdir -p overrides
-        cat > overrides/compose.custom.yaml <<EOF
-version: "3"
-services:
-  backend:
-    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
-    pull_policy: never
-  frontend:
-    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
-    pull_policy: never
-  queue-default:
-    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
-    pull_policy: never
-  queue-long:
-    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
-    pull_policy: never
-  queue-short:
-    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
-    pull_policy: never
-  scheduler:
-    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
-    pull_policy: never
-  websocket:
-    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
-    pull_policy: never
-  configurator:
-    image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}
-    pull_policy: never
-EOF
-        COMPOSE_FILES="-f compose.yaml -f overrides/compose.custom.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
+# ---------- Wait for MariaDB root to accept password ----------
+wait_for_mariadb_root() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local tries=0
+    local max=30
+    info "Waiting for MariaDB to accept root password (try up to ${max})..."
+    while true; do
+        if docker compose ${compose_files} --env-file .env exec -T db mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "SELECT 1;" &>/dev/null; then
+            info "MariaDB root auth OK"
+            return 0
+        fi
+        tries=$((tries+1))
+        if [ "$tries" -ge "$max" ]; then
+            warn "MariaDB root auth failed after ${max} attempts"
+            return 1
+        fi
+        sleep 3
+    done
+}
+
+# ---------- Ensure frappe DB user exists and matches DB_PASSWORD ----------
+ensure_frappe_db_user() {
+    local compose_files
+    compose_files=$(get_compose_files)
+
+    # default DB user name used by bench/ERPNext images is often 'frappe'
+    local DB_USER=${MYSQL_USER:-frappe}
+    local DB_PASS="${DB_PASSWORD:-${MYSQL_ROOT_PASSWORD}}"
+    local DB_NAME=${MYSQL_DATABASE:-${DB_NAME:-'frappe'})}
+    # Some compose setups use separate DB name, but we'll create a user and grant privileges on *.* to be safe
+
+    info "Ensuring DB user '${DB_USER}' exists with provided password..."
+    # create user if missing and set password; use root creds
+    docker compose ${compose_files} --env-file .env exec -T db mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "\
+        CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}'; \
+        ALTER USER '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}'; \
+        GRANT ALL PRIVILEGES ON *.* TO '${DB_USER}'@'%' WITH GRANT OPTION; \
+        FLUSH PRIVILEGES;" &>/dev/null || {
+        warn "Failed to ensure DB user '${DB_USER}' via root. Will continue but DB auth problems may persist."
+        return 1
+    }
+    info "DB user '${DB_USER}' ensured"
+    return 0
+}
+
+# ---------- Deploy stack ----------
+deploy_stack() {
+    check_required_files
+
+    local compose_files
+    compose_files=$(get_compose_files)
+
+    info "Bringing up DB and Redis first..."
+    # Start minimal services required for DB init
+    docker compose ${compose_files} --env-file .env up -d db redis-cache redis-queue
+    sleep 5
+
+    # Wait for DB to be ready and accept root creds
+    if ! wait_for_mariadb_root; then
+        warn "MariaDB root auth didn't become available. You may need to inspect DB logs."
     else
-        COMPOSE_FILES="-f compose.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
+        # ensure frappe user matches DB_PASSWORD
+        ensure_frappe_db_user || warn "ensure_frappe_db_user failed"
     fi
-    
-    docker compose $COMPOSE_FILES --env-file .env up -d
-    
-    log_info "Services started! Waiting for initialization..."
-    sleep 15
-    
-    source .env
-    SITE_NAME=${FRAPPE_SITE_NAME_HEADER:-localhost}
-    
-    # 等待服务完全启动
-    log_info "Waiting for backend service to be ready..."
-    for i in {1..30}; do
-        if docker compose $COMPOSE_FILES exec -T backend bench --version &> /dev/null; then
-            log_info "Backend service is ready!"
+
+    info "Bringing up remaining services..."
+    docker compose ${compose_files} --env-file .env up -d --remove-orphans
+    info "All services started (docker compose up -d). Waiting for backend to be ready..."
+
+    # wait for backend bench to be responsive
+    local tries=0
+    local max=30
+    while true; do
+        if docker compose ${compose_files} --env-file .env exec -T backend bench --version &>/dev/null; then
+            info "Backend bench responsive"
             break
         fi
-        log_info "Waiting for backend service... ($i/30)"
-        sleep 10
+        tries=$((tries+1))
+        if [ "$tries" -ge "$max" ]; then
+            warn "Backend didn't become responsive after $max tries"
+            break
+        fi
+        sleep 5
     done
-    
-    # 检查站点是否存在
-    if ! docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" list-apps &> /dev/null; then
-        log_info "Creating new site: $SITE_NAME"
-        docker compose $COMPOSE_FILES exec -T backend bench new-site "$SITE_NAME" \
-            --admin-password admin \
+
+    # create site if missing
+    info "Checking if site '${SITE_NAME}' exists..."
+    if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" list-apps &>/dev/null; then
+        info "Creating new site: ${SITE_NAME}"
+        docker compose ${compose_files} --env-file .env exec -T backend bench new-site "${SITE_NAME}" \
+            --admin-password "${ADMIN_PASSWORD:-admin}" \
             --mariadb-root-username root \
-            --mariadb-root-password "${MYSQL_ROOT_PASSWORD:-admin}" \
+            --mariadb-root-password "${MYSQL_ROOT_PASSWORD}" \
             --install-app erpnext \
-            --set-default
+            --set-default || warn "bench new-site returned non-zero exit; check logs"
+        # install other apps (telephony, hrms, helpdesk, print_designer, insights, drive)
+        for app in telephony hrms helpdesk print_designer insights drive; do
+            info "Attempting to install app: ${app}"
+            docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" install-app "${app}" || warn "install-app ${app} failed"
+        done
+		# --- ensure bench-generated DB user exists in MariaDB ---
+        site_config="./sites/${SITE_NAME}/site_config.json"
+        if [ -f "$site_config" ]; then
+            DB_NAME=$(jq -r '.db_name' "$site_config")
+            DB_PASS=$(jq -r '.db_password' "$site_config")
+            info "Creating MariaDB user for site: $DB_NAME"
         
-        # 如果使用自定义镜像，安装额外的应用
-        if [ -n "${CUSTOM_IMAGE}" ] && docker images "${CUSTOM_IMAGE}:${CUSTOM_TAG}" &> /dev/null; then
-            log_info "Installing additional apps on site..."
-            docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" install-app telephony || log_warning "Failed to install telephony"
-            docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" install-app hrms || log_warning "Failed to install hrms"
-            docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" install-app helpdesk || log_warning "Failed to install helpdesk"
-            docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" install-app print_designer || log_warning "Failed to install print_designer"
-            docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" install-app insights || log_warning "Failed to install insights"
-            docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" install-app drive || log_warning "Failed to install drive"			
+            docker compose ${compose_files} --env-file .env exec -T db mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "\
+                CREATE USER IF NOT EXISTS '${DB_NAME}'@'%' IDENTIFIED BY '${DB_PASS}'; \
+                GRANT ALL PRIVILEGES ON *.* TO '${DB_NAME}'@'%' WITH GRANT OPTION; \
+                FLUSH PRIVILEGES;" &>/dev/null || warn "Failed to create site DB user"
         fi
     else
-        log_info "Site $SITE_NAME already exists"
+        info "Site ${SITE_NAME} already exists"
     fi
-    
-    log_info "Deployment completed successfully! 🎉"
-    log_info "Access your ERPNext at: http://localhost:8080"
-    log_info "Default credentials: Administrator / admin"
+
+    info "Deployment completed"
 }
 
-# 获取 Docker Compose 文件列表的辅助函数
-get_compose_files() {
-    if [ -f .env ]; then
-        export $(grep -v '^#' .env | xargs)
-    fi
-
-    if [ -f "overrides/compose.custom.yaml" ]; then
-        echo "-f compose.yaml -f overrides/compose.custom.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
-    else
-        echo "-f compose.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
-    fi
+# ---------- Helper: check required files ----------
+check_required_files() {
+    [ -f "${ENV_FILE}" ] || (error ".env missing" && exit 1)
+    [ -f "compose.yaml" ] || [ -f "docker-compose.yml" ] || (error "compose.yaml or docker-compose.yml missing" && exit 1)
 }
 
-# 清理临时文件
-cleanup() {
-    if [ -f "overrides/compose.custom.yaml" ]; then
-        rm -f overrides/compose.custom.yaml
-    fi
-    if [ -f "Dockerfile.custom" ]; then
-        rm -f Dockerfile.custom
-    fi
+# ---------- Commands ----------
+cmd_deploy() {
+    check_required_files
+    deploy_stack
+}
+cmd_build_custom_image() {
+    check_required_files
+    build_custom_image
+}
+cmd_start() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env up -d
+}
+cmd_stop() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env down
+}
+cmd_restart() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    info "Restarting all services safely..."
+    docker compose ${compose_files} --env-file $ENV_FILE restart
+    # wait backend
+    local tries=0; local max=30
+    while true; do
+        if docker compose ${compose_files} --env-file .env exec -T backend bench --version &>/dev/null; then
+            info "Backend ready"
+            break
+        fi
+        tries=$((tries+1))
+        if [ "$tries" -ge "$max" ]; then
+            warn "Backend not ready after ${max} tries"
+            break
+        fi
+        sleep 5
+    done
+    info "Restart completed"
+}
+cmd_logs() {
+    local svc=${2:-backend}
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env logs -f --tail=200 "${svc}"
+}
+cmd_status() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env ps
+}
+cmd_cleanup() {
+    cleanup_tmp
+    info "Temp files removed"
+}
+cmd_force_cleanup() {
+    info "Force cleanup: stopping containers, removing volumes and unused data (DANGEROUS)"
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env down -v --remove-orphans || true
+    docker system prune -af --volumes || true
+    info "Force cleanup done"
+}
+cmd_rebuild_and_deploy() {
+    cmd_force_cleanup
+    cmd_build_custom_image
+    cmd_deploy
+}
+cmd_fix_routing() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    info "Restarting frontend/websocket/nginx to refresh routing"
+    docker compose ${compose_files} --env-file .env restart frontend websocket || true
+}
+cmd_fix_configurator() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    info "Re-running configurator"
+    docker compose ${compose_files} --env-file .env run --rm configurator || true
 }
 
-# 捕获退出信号进行清理
-trap cleanup EXIT
-
-case "$1" in
-    deploy) 
-        deploy 
-        ;;
-    build-custom-image) 
-        build_custom_image 
-        ;;
-    status) 
-        COMPOSE_FILES=$(get_compose_files)
-        docker compose $COMPOSE_FILES --env-file .env ps 
-        ;;
-    start) 
-        COMPOSE_FILES=$(get_compose_files)
-        docker compose $COMPOSE_FILES --env-file .env up -d 
-        ;;
-    stop) 
-        COMPOSE_FILES=$(get_compose_files)
-        docker compose $COMPOSE_FILES --env-file .env down 
-        ;;
-    restart) 
-        COMPOSE_FILES=$(get_compose_files)
-        docker compose $COMPOSE_FILES --env-file .env down && \
-        docker compose $COMPOSE_FILES --env-file .env up -d 
-        ;;
-    logs)
-        COMPOSE_FILES=$(get_compose_files)
-        docker compose $COMPOSE_FILES --env-file .env logs -f "${2:-backend}"
-        ;;
-    force-cleanup)
-        log_info "Performing force cleanup..."
-        docker compose down -v 2>/dev/null || true
-        docker system prune -f 2>/dev/null || true
-        docker rm -f $(docker ps -aq) 2>/dev/null || true && docker volume rm $(docker volume ls -q) 2>/dev/null || true
-        cleanup
-        log_info "Force cleanup completed"
-        ;;		
-    cleanup)
-        cleanup
-        log_info "Cleaned up temporary files"
-        ;;
-    rebuild-and-deploy)
-        log_info "Rebuilding enhanced custom image and redeploying..."
-        log_info "Performing force cleanup..."
-        docker compose down -v 2>/dev/null || true
-        docker system prune -f 2>/dev/null || true
-        docker rm -f $(docker ps -aq) 2>/dev/null || true && docker volume rm $(docker volume ls -q) 2>/dev/null || true
-        cleanup
-        build_custom_image
-        deploy
-        ;;
-    fix-routing)
-        log_info "Fixing app routing issues..."
-        COMPOSE_FILES=$(get_compose_files)
-        source .env
-        SITE_NAME=${FRAPPE_SITE_NAME_HEADER:-localhost}
-        
-        # 清除所有缓存
-        log_info "Clearing caches..."
-        docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" clear-cache
-        docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" clear-website-cache
-        
-        # 重新生成路由
-        log_info "Regenerating routes..."
-        docker compose $COMPOSE_FILES exec -T backend bench --site "$SITE_NAME" migrate || log_warning "Migration failed"
-        
-        # 重启相关服务
-        log_info "Restarting services..."
-        docker compose $COMPOSE_FILES restart backend frontend websocket
-        
-        log_info "Routing fix completed. Please refresh your browser and try again."
-        ;;
-    fix-configurator)
-        log_info "Attempting to fix configurator issues..."
-        COMPOSE_FILES=$(get_compose_files)
-        
-        # Stop and remove problematic containers
-        docker compose $COMPOSE_FILES down || true
-        
-        # Remove any problematic app from the image if needed
-        log_info "Creating temporary fix container..."
-        docker run --rm -v frappe_docker_sites:/home/frappe/frappe-bench/sites \
-               ${CUSTOM_IMAGE}:${CUSTOM_TAG} bash -c "
-                   if [ -d 'apps/insights' ] && ! python -c 'import insights' 2>/dev/null; then
-                       echo 'Removing problematic insights app...'
-                       rm -rf apps/insights
-                       echo 'Insights app removed successfully'
-                   fi
-               " || true
-               
-        # Restart services
-        docker compose $COMPOSE_FILES --env-file .env up -d
-        log_info "Fix attempt completed"
-        ;;		
+# ---------- CLI dispatch ----------
+case "${1:-}" in
+    deploy)            cmd_deploy ;;
+    build-custom-image)cmd_build_custom_image ;;
+    start)             cmd_start ;;
+    stop)              cmd_stop ;;
+    restart)           cmd_restart ;;
+    logs)              cmd_logs "${@}" ;;
+    status)            cmd_status ;;
+    cleanup)           cmd_cleanup ;;
+    force-cleanup)     cmd_force_cleanup ;;
+    rebuild-and-deploy)cmd_rebuild_and_deploy ;;
+    fix-routing)       cmd_fix_routing ;;
+    fix-configurator)  cmd_fix_configurator ;;
     *) 
-        echo "Usage: $0 {deploy|build-custom-image|status|start|stop|restart|logs|cleanup}"
-        echo "  deploy              - Deploy the complete stack"
-        echo "  build-custom-image  - Build custom ERPNext image with additional apps"
-        echo "  status             - Show container status"  
-        echo "  start              - Start all services"
-        echo "  stop               - Stop all services"
-        echo "  restart            - Restart all services"
-        echo "  logs [service]     - Show logs (default: backend)"
-        echo "  cleanup            - Clean up temporary files"
-        echo "  force-cleanup      - Force cleanup including volumes and containers"
-        echo "  rebuild-and-deploy - Rebuild enhanced custom image and redeploy"	
-        echo "  fix-routing        - Fix app routing issues (missing /app/ prefix)"
-        echo "  fix-configurator   - Fix configurator startup issues"		
+        cat <<USAGE
+Usage: $0 {deploy|build-custom-image|start|stop|restart|logs|status|cleanup|force-cleanup|rebuild-and-deploy|fix-routing|fix-configurator}
+Notes:
+ - Gameplan is commented out in Dockerfile.custom (per your request).
+ - To fully reset DB/volumes in dev: $0 force-cleanup
+ - Make sure .env contains MYSQL_ROOT_PASSWORD and DB_PASSWORD
+USAGE
+        exit 1
         ;;
 esac

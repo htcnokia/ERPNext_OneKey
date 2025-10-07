@@ -167,6 +167,55 @@ ensure_frappe_db_user() {
     return 0
 }
 
+check_mysql_user() {
+    local compose_files
+    compose_files=$(get_compose_files)
+
+    info "Checking MariaDB user for site '${SITE_NAME}'..."
+
+    # 从 backend 容器中读取 site_config.json
+    local SITE_JSON
+    SITE_JSON=$(docker compose ${compose_files} --env-file .env exec -T backend \
+        cat "sites/${SITE_NAME}/site_config.json" 2>/dev/null)
+
+    if [ -z "$SITE_JSON" ]; then
+        warn "site_config.json not found in backend container for site ${SITE_NAME}"
+        return
+    fi
+
+    local DB_NAME DB_PASS
+    DB_NAME=$(echo "$SITE_JSON" | jq -r '.db_name')
+    DB_PASS=$(echo "$SITE_JSON" | jq -r '.db_password')
+
+    if [ -z "$DB_NAME" ] || [ "$DB_NAME" = "null" ]; then
+        warn "Invalid DB_NAME in site_config.json"
+        return
+    fi
+
+    info "Verifying MariaDB user '${DB_NAME}' existence..."
+
+    # 改进：通过 SHOW GRANTS 判断是否存在该用户
+    local USER_EXISTS
+    USER_EXISTS=$(docker compose ${compose_files} --env-file .env exec -T db \
+        mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -N -B -e \
+        "SHOW GRANTS FOR '${DB_NAME}'@'%';" 2>/dev/null | head -n1)
+
+    if [[ "$USER_EXISTS" == *"GRANT"* ]]; then
+        info "MariaDB user '${DB_NAME}' already exists."
+    else
+        info "Creating MariaDB user '${DB_NAME}'..."
+        docker compose ${compose_files} --env-file .env exec -T db \
+            mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "\
+            CREATE USER IF NOT EXISTS '${DB_NAME}'@'%' IDENTIFIED BY '${DB_PASS}'; \
+            GRANT ALL PRIVILEGES ON *.* TO '${DB_NAME}'@'%' WITH GRANT OPTION; \
+            FLUSH PRIVILEGES;" \
+        && info "User '${DB_NAME}' created successfully." \
+        || warn "Failed to create MariaDB user '${DB_NAME}'"
+    fi
+}
+
+
+
 # ---------- Deploy stack ----------
 deploy_stack() {
     check_required_files
@@ -217,27 +266,15 @@ deploy_stack() {
             --mariadb-root-password "${MYSQL_ROOT_PASSWORD}" \
             --install-app erpnext \
             --set-default || warn "bench new-site returned non-zero exit; check logs"
-        # install other apps (telephony, hrms, helpdesk, print_designer, insights, drive)
-        for app in telephony hrms helpdesk print_designer insights drive; do
+        # install other apps (telephony, hrms, helpdesk, print_designer, insights,gameplan, drive)
+        for app in telephony hrms helpdesk print_designer insights gameplan drive; do
             info "Attempting to install app: ${app}"
             docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" install-app "${app}" || warn "install-app ${app} failed"
         done
-		# --- ensure bench-generated DB user exists in MariaDB ---
-        site_config="./sites/${SITE_NAME}/site_config.json"
-        if [ -f "$site_config" ]; then
-            DB_NAME=$(jq -r '.db_name' "$site_config")
-            DB_PASS=$(jq -r '.db_password' "$site_config")
-            info "Creating MariaDB user for site: $DB_NAME"
-        
-            docker compose ${compose_files} --env-file .env exec -T db mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "\
-                CREATE USER IF NOT EXISTS '${DB_NAME}'@'%' IDENTIFIED BY '${DB_PASS}'; \
-                GRANT ALL PRIVILEGES ON *.* TO '${DB_NAME}'@'%' WITH GRANT OPTION; \
-                FLUSH PRIVILEGES;" &>/dev/null || warn "Failed to create site DB user"
-        fi
     else
         info "Site ${SITE_NAME} already exists"
     fi
-
+    check_mysql_user
     info "Deployment completed"
 }
 
@@ -257,6 +294,7 @@ cmd_build_custom_image() {
     build_custom_image
 }
 cmd_start() {
+    check_mysql_user
     local compose_files
     compose_files=$(get_compose_files)
     docker compose ${compose_files} --env-file .env up -d
@@ -267,6 +305,7 @@ cmd_stop() {
     docker compose ${compose_files} --env-file .env down
 }
 cmd_restart() {
+    check_mysql_user
     local compose_files
     compose_files=$(get_compose_files)
     info "Restarting all services safely..."
@@ -315,6 +354,9 @@ cmd_rebuild_and_deploy() {
     cmd_build_custom_image
     cmd_deploy
 }
+cmd_redeploy() {
+    cmd_deploy
+}
 cmd_fix_routing() {
     local compose_files
     compose_files=$(get_compose_files)
@@ -326,6 +368,9 @@ cmd_fix_configurator() {
     compose_files=$(get_compose_files)
     info "Re-running configurator"
     docker compose ${compose_files} --env-file .env run --rm configurator || true
+}
+cmd_check_mysql_user(){
+    check_mysql_user
 }
 
 # ---------- CLI dispatch ----------
@@ -340,11 +385,13 @@ case "${1:-}" in
     cleanup)           cmd_cleanup ;;
     force-cleanup)     cmd_force_cleanup ;;
     rebuild-and-deploy)cmd_rebuild_and_deploy ;;
+    redeploy)          cmd_redeploy ;;	
     fix-routing)       cmd_fix_routing ;;
     fix-configurator)  cmd_fix_configurator ;;
+	check_mysql_user) cmd_check_mysql_user ;;
     *) 
         cat <<USAGE
-Usage: $0 {deploy|build-custom-image|start|stop|restart|logs|status|cleanup|force-cleanup|rebuild-and-deploy|fix-routing|fix-configurator}
+Usage: $0 {deploy|build-custom-image|start|stop|restart|logs|status|cleanup|force-cleanup|rebuild-and-deploy|redeploy|fix-routing|fix-configurator|check_mysql_user}
 Notes:
  - Gameplan is commented out in Dockerfile.custom (per your request).
  - To fully reset DB/volumes in dev: $0 force-cleanup

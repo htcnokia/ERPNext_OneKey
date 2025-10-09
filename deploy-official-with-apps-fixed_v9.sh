@@ -173,47 +173,52 @@ check_mysql_user() {
 
     info "Checking MariaDB user for site '${SITE_NAME}'..."
 
-    # 从 backend 容器中读取 site_config.json
+    # 从 backend 容器读取 site_config.json
     local SITE_JSON
-    SITE_JSON=$(docker compose ${compose_files} --env-file .env exec -T backend \
-        cat "sites/${SITE_NAME}/site_config.json" 2>/dev/null)
-
+    if ! SITE_JSON=$(docker compose ${compose_files} --env-file .env exec -T backend \
+        cat "sites/${SITE_NAME}/site_config.json" 2>/dev/null); then
+        warn "Failed to read site_config.json from backend container."
+        return 1
+    fi
     if [ -z "$SITE_JSON" ]; then
-        warn "site_config.json not found in backend container for site ${SITE_NAME}"
-        return
+        warn "site_config.json not found or empty in backend container for site ${SITE_NAME}"
+        return 1
     fi
 
+    # 提取数据库名和密码
     local DB_NAME DB_PASS
-    DB_NAME=$(echo "$SITE_JSON" | jq -r '.db_name')
-    DB_PASS=$(echo "$SITE_JSON" | jq -r '.db_password')
+    DB_NAME=$(echo "$SITE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('db_name',''))" 2>/dev/null || true)
+    DB_PASS=$(echo "$SITE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('db_password',''))" 2>/dev/null || true)
 
-    if [ -z "$DB_NAME" ] || [ "$DB_NAME" = "null" ]; then
-        warn "Invalid DB_NAME in site_config.json"
-        return
+    if [ -z "$DB_NAME" ] || [ -z "$DB_PASS" ]; then
+        warn "Could not parse db_name or db_password from site_config.json"
+        return 1
     fi
 
-    info "Verifying MariaDB user '${DB_NAME}' existence..."
+    info "Verifying MariaDB user '${DB_NAME}' connectivity..."
 
-    # 改进：通过 SHOW GRANTS 判断是否存在该用户
-    local USER_EXISTS
-    USER_EXISTS=$(docker compose ${compose_files} --env-file .env exec -T db \
-        mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -N -B -e \
-        "SHOW GRANTS FOR '${DB_NAME}'@'%';" 2>/dev/null | head -n1)
-
-    if [[ "$USER_EXISTS" == *"GRANT"* ]]; then
-        info "MariaDB user '${DB_NAME}' already exists."
+    # 尝试用实际账号连接数据库
+    if docker compose ${compose_files} --env-file .env exec -T db \
+        mariadb -u"${DB_NAME}" -p"${DB_PASS}" -D"${DB_NAME}" -e "SELECT 1;" &>/dev/null; then
+        info "User '${DB_NAME}' can connect and has access — nothing to do."
     else
-        info "Creating MariaDB user '${DB_NAME}'..."
+        warn "User '${DB_NAME}' cannot connect — attempting to create/update via root..."
+
         docker compose ${compose_files} --env-file .env exec -T db \
             mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "\
-            CREATE USER IF NOT EXISTS '${DB_NAME}'@'%' IDENTIFIED BY '${DB_PASS}'; \
-            GRANT ALL PRIVILEGES ON *.* TO '${DB_NAME}'@'%' WITH GRANT OPTION; \
-            FLUSH PRIVILEGES;" \
-        && info "User '${DB_NAME}' created successfully." \
-        || warn "Failed to create MariaDB user '${DB_NAME}'"
+                DROP USER IF EXISTS '${DB_NAME}'@'%';
+                CREATE USER '${DB_NAME}'@'%' IDENTIFIED BY '${DB_PASS}';
+                GRANT ALL PRIVILEGES ON *.* TO '${DB_NAME}'@'%' WITH GRANT OPTION;
+                FLUSH PRIVILEGES;" \
+        && info "User '${DB_NAME}' created/updated successfully." \
+        || warn "Failed to create/update user '${DB_NAME}' via root."
     fi
-}
 
+    # 验证最终权限
+    info "Verifying updated grants for '${DB_NAME}'..."
+    docker compose ${compose_files} --env-file .env exec -T db \
+        mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "SHOW GRANTS FOR '${DB_NAME}'@'%';" || true
+}
 
 
 # ---------- Deploy stack ----------
@@ -294,10 +299,11 @@ cmd_build_custom_image() {
     build_custom_image
 }
 cmd_start() {
-    check_mysql_user
     local compose_files
     compose_files=$(get_compose_files)
+	info "Starting all services safely..."
     docker compose ${compose_files} --env-file .env up -d
+	check_mysql_user
 }
 cmd_stop() {
     local compose_files
@@ -305,7 +311,6 @@ cmd_stop() {
     docker compose ${compose_files} --env-file .env down
 }
 cmd_restart() {
-    check_mysql_user
     local compose_files
     compose_files=$(get_compose_files)
     info "Restarting all services safely..."
@@ -324,6 +329,7 @@ cmd_restart() {
         fi
         sleep 5
     done
+    check_mysql_user
     info "Restart completed"
 }
 cmd_logs() {

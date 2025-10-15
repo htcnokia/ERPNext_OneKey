@@ -1,4 +1,5 @@
 #!/bin/bash
+: "${ERPNEXT_VERSION:=v15.83.0}"
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,27 +28,11 @@ load_env_file() {
     info "Environment variables loaded from ${env_file}"
 }
 
-# Allow global debug flag as first argument
-DEBUG=${DEBUG:-false}
-if [[ "${1:-}" == "--debug" ]]; then
-    DEBUG=true
-    shift
-fi
-
 # Load .env immediately so exported vars are available to functions
 load_env_file "$ENV_FILE"
 
-# Debug dump
-if [[ "$DEBUG" == "true" ]] then
-    info "DEBUG: important env vars after loading .env"
-    echo "  BASE_TAG=${ERPNEXT_VERSION:-${ERPNEXT_VERSION:-unset}}"
-    echo "  CUSTOM_IMAGE=${CUSTOM_IMAGE:-${CUSTOM_IMAGE:-unset}}"
-    echo "  CUSTOM_TAG=${CUSTOM_TAG:-${CUSTOM_TAG:-unset}}"
-    echo "  SITE_NAME=${SITES:-${SITES:-unset}}"
-fi
-
 # defaults (if .env lacks them) - unified to latest stable
-BASE_TAG=${ERPNEXT_VERSION:-v15.82.1}
+BASE_TAG="${ERPNEXT_VERSION}"
 CUSTOM_IMAGE=${CUSTOM_IMAGE:-my-erpnext-v15-custom}
 CUSTOM_TAG=${CUSTOM_TAG:-latest}
 SITE_NAME=${SITES:-nexterp}
@@ -86,12 +71,94 @@ is_build_complete() {
     return 0
 }
 
+# ---------- Auto detect latest compatible app versions from GitHub ----------
+auto_detect_app_versions() {
+    local token_header=""
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        token_header="-H Authorization: token ${GITHUB_TOKEN}"
+    fi
+
+    # 基础 GitHub API 函数
+    get_repo_tags() {
+        local repo="$1"
+        curl -s $token_header "https://api.github.com/repos/${repo}/tags?per_page=100" | jq -r '.[].name'
+    }
+
+    get_repo_branches() {
+        local repo="$1"
+        curl -s $token_header "https://api.github.com/repos/${repo}/branches?per_page=100" | jq -r '.[].name'
+    }
+
+    get_highest_tag_for_major() {
+        local repo="$1"
+        local major="$2"
+        get_repo_tags "$repo" | grep -E "^v?${major}\." | sort -V | tail -n1
+    }
+
+    get_highest_tag_overall() {
+        local repo="$1"
+        get_repo_tags "$repo" | grep -E '^v?[0-9]' | sort -V | tail -n1
+    }
+
+    get_highest_major() {
+        local repo="$1"
+        get_repo_tags "$repo" | grep -E '^v?[0-9]+' | sed -E 's/^v?([0-9]+).*/\1/' | sort -n | tail -n1
+    }
+
+    # ---------- 检测 frappe/erpnext 主版本 ----------
+    local frappe_major=$(get_highest_major "frappe/frappe")
+    local erpnext_major=$(get_highest_major "frappe/erpnext")
+
+    # 取最大主版本号
+    local major_ver=$(( frappe_major > erpnext_major ? frappe_major : erpnext_major ))
+
+    info "🔍 Detected latest major version: v${major_ver}"
+
+    # ---------- 匹配各 App ----------
+    FRAPPE_BRANCH=$(get_highest_tag_for_major "frappe/frappe" "$major_ver")
+    ERPNEXT_BRANCH=$(get_highest_tag_for_major "frappe/erpnext" "$major_ver")
+
+    # HRMS：找 version-xx 分支
+    local hrms_branches=$(get_repo_branches "frappe/hrms")
+    local target_branch="version-${major_ver}"
+    local prev_branch="version-$((major_ver - 1))"
+
+    if echo "$hrms_branches" | grep -q "^${target_branch}$"; then
+        HRMS_BRANCH="${target_branch}"
+    elif echo "$hrms_branches" | grep -q "^${prev_branch}$"; then
+        HRMS_BRANCH="${prev_branch}"
+    else
+        HRMS_BRANCH=$(get_highest_tag_overall "frappe/hrms")
+    fi
+
+    TELEPHONY_BRANCH="develop"
+    HELP_DESK_BRANCH=$(get_highest_tag_overall "frappe/helpdesk")
+    PRINT_DESIGNER_BRANCH=$(get_highest_tag_overall "frappe/print_designer")
+    INSIGHTS_BRANCH=$(get_highest_tag_overall "frappe/insights")
+    DRIVE_BRANCH=$(get_highest_tag_overall "frappe/drive")
+	CUSTOM_IMAGE="my-erpnext-v${major_ver}--custom"
+	
+    export FRAPPE_BRANCH ERPNEXT_BRANCH HRMS_BRANCH TELEPHONY_BRANCH HELP_DESK_BRANCH PRINT_DESIGNER_BRANCH INSIGHTS_BRANCH DRIVE_BRANCH CUSTOM_IMAGE
+
+    # ---------- 输出 ----------
+    info "✅ Auto-selected versions from GitHub (aligned with v${major_ver}):"
+    echo "  FRAPPE_BRANCH=${FRAPPE_BRANCH}"
+    echo "  ERPNEXT_BRANCH=${ERPNEXT_BRANCH}"
+    echo "  HRMS_BRANCH=${HRMS_BRANCH}"
+    echo "  TELEPHONY_BRANCH=${TELEPHONY_BRANCH}"
+    echo "  HELP_DESK_BRANCH=${HELP_DESK_BRANCH}"
+    echo "  PRINT_DESIGNER_BRANCH=${PRINT_DESIGNER_BRANCH}"
+    echo "  INSIGHTS_BRANCH=${INSIGHTS_BRANCH}"
+    echo "  DRIVE_BRANCH=${DRIVE_BRANCH}"
+	echo "  CUSTOM_IMAGE=${CUSTOM_IMAGE}"
+}
+
 # ---------- Generate Dockerfile.custom ----------
 generate_custom_dockerfile() {
     info "Generating Dockerfile.custom..."
     local erpnext_ver="${ERPNEXT_VERSION:-${BASE_TAG}}"
     local github_erpnext_ver="${GITHUB_ERPNEXT_VERSION:-${erpnext_ver}}"
-
+    
     # 提取版本号（移除 "v" 前缀以便比较）
     local erpnext_ver_num=$(echo "$erpnext_ver" | sed 's/^v//')
     local github_ver_num=$(echo "$github_erpnext_ver" | sed 's/^v//')
@@ -108,14 +175,20 @@ generate_custom_dockerfile() {
     # Fallback for erpnext base image: 如果 ERPNEXT_VERSION 不存在，使用 BASE_TAG
     local fallback_erpnext_ver="${BASE_TAG}"
     if ! docker image inspect "frappe/erpnext:${erpnext_ver}" >/dev/null 2>&1; then
-        info "Erpnext version ${erpnext_ver} not found, using fallback: ${fallback_erpnext_ver}"
+        info "Erpnext version in docker.io ${erpnext_ver} not found, using fallback: ${fallback_erpnext_ver}"
         erpnext_ver="$fallback_erpnext_ver"
     fi
-
+	
+    use_github=true
     if [ "$use_github" = true ]; then
+        info "Using GitHub to get the latest version..."
+	    auto_detect_app_versions
+		github_erpnext_ver=${ERPNEXT_BRANCH}
+		erpnext_ver=${ERPNEXT_BRANCH}
+		ERPNEXT_VERSION=${ERPNEXT_BRANCH}
         info "Using GitHub source for erpnext: ${github_erpnext_ver} (base: frappe/erpnext:${erpnext_ver})"
         cat > Dockerfile.custom <<EOF
-ARG ERPNEXT_VERSION=${erpnext_ver}
+ARG ERPNEXT_VERSION=${ERPNEXT_BRANCH}
 FROM frappe/erpnext:\${ERPNEXT_VERSION}
 
 # Increase Node heap limit to avoid OOM during build
@@ -142,12 +215,12 @@ RUN npm install -g npm@latest && \
 RUN mkdir -p sites && echo '{"socketio_port": 9000}' > sites/common_site_config.json
 
 # Download / get additional apps (step-by-step for caching and memory)
-RUN bench get-app --branch develop https://github.com/frappe/telephony --skip-assets
-RUN bench get-app --branch version-15 https://github.com/frappe/hrms --skip-assets
-RUN bench get-app --branch main https://github.com/frappe/helpdesk --skip-assets
-RUN bench get-app --branch main https://github.com/frappe/print_designer --skip-assets
-RUN bench get-app --branch develop https://github.com/frappe/insights --skip-assets
-RUN bench get-app --branch main https://github.com/frappe/drive --skip-assets
+RUN bench get-app --branch ${TELEPHONY_BRANCH} https://github.com/frappe/telephony --skip-assets
+RUN bench get-app --branch ${HRMS_BRANCH} https://github.com/frappe/hrms --skip-assets
+RUN bench get-app --branch ${HELP_DESK_BRANCH} https://github.com/frappe/helpdesk --skip-assets
+RUN bench get-app --branch ${PRINT_DESIGNER_BRANCH} https://github.com/frappe/print_designer --skip-assets
+RUN bench get-app --branch ${INSIGHTS_BRANCH} https://github.com/frappe/insights --skip-assets
+RUN bench get-app --branch ${DRIVE_BRANCH} https://github.com/frappe/drive --skip-assets
 
 # Build apps individually (step-by-step for memory efficiency)
 RUN bench build --app frappe
@@ -158,6 +231,45 @@ RUN bench build --app helpdesk
 RUN bench build --app insights
 RUN bench build --app drive
 EOF
+        # --- 回写版本信息到 .env ---
+        local ENV_FILE="${PROJECT_DIR}/.env"
+        info "Updating ERPNext version info in ${ENV_FILE} ..."
+
+        # 确定最终使用版本（优先使用 GitHub 版本）
+        local final_erpnext_version="${ERPNEXT_BRANCH:-${erpnext_ver}}"
+
+        # 确保 .env 存在
+        if [ ! -f "$ENV_FILE" ]; then
+            warn ".env not found, creating a new one..."
+            touch "$ENV_FILE"
+        fi
+
+        # 删除旧的 ERPNEXT_VERSION / GITHUB_ERPNEXT_VERSION 行
+		sed -i '/^CUSTOM_IMAGE=/d' "$ENV_FILE"
+        sed -i '/^FRAPPE_VERSION=/d' "$ENV_FILE"		
+        sed -i '/^ERPNEXT_VERSION=/d' "$ENV_FILE"
+        sed -i '/^GITHUB_ERPNEXT_VERSION=/d' "$ENV_FILE"
+        sed -i '/^HRMS_BRANCH=/d' "$ENV_FILE"
+        sed -i '/^HELP_DESK_BRANCH=/d' "$ENV_FILE"
+        sed -i '/^PRINT_DESIGNER_BRANCH=/d' "$ENV_FILE"
+        sed -i '/^INSIGHTS_BRANCH=/d' "$ENV_FILE"
+        sed -i '/^DRIVE_BRANCH=/d' "$ENV_FILE"
+		
+        # 写入新的版本信息
+        {
+            echo "FRAPPE_VERSION=${FRAPPE_BRANCH}"
+            echo "ERPNEXT_VERSION=${final_erpnext_version}"
+            echo "GITHUB_ERPNEXT_VERSION=${github_erpnext_ver}"
+            echo "HRMS_BRANCH=${HRMS_BRANCH}"
+            echo "TELEPHONY_BRANCH=${TELEPHONY_BRANCH}"
+            echo "HELP_DESK_BRANCH=${HELP_DESK_BRANCH}"
+            echo "PRINT_DESIGNER_BRANCH=${PRINT_DESIGNER_BRANCH}"
+            echo "INSIGHTS_BRANCH=${INSIGHTS_BRANCH}"
+            echo "DRIVE_BRANCH=${DRIVE_BRANCH}"  
+            echo "CUSTOM_IMAGE=${CUSTOM_IMAGE}"			
+        } >> "$ENV_FILE"
+
+        info "✅ .env updated: ERPNEXT_VERSION=${final_erpnext_version}"
     else
         info "Using Docker Hub for erpnext: ${erpnext_ver}"
         cat > Dockerfile.custom <<EOF
@@ -176,12 +288,12 @@ WORKDIR /home/frappe/frappe-bench
 RUN mkdir -p sites && echo '{"socketio_port": 9000}' > sites/common_site_config.json
 
 # Download / get additional apps (step-by-step for caching and memory)
-RUN bench get-app --branch develop https://github.com/frappe/telephony --skip-assets
-RUN bench get-app --branch version-15 https://github.com/frappe/hrms --skip-assets
-RUN bench get-app --branch main https://github.com/frappe/helpdesk --skip-assets
-RUN bench get-app --branch main https://github.com/frappe/print_designer --skip-assets
-RUN bench get-app --branch develop https://github.com/frappe/insights --skip-assets
-RUN bench get-app --branch main https://github.com/frappe/drive --skip-assets
+RUN bench get-app --branch ${TELEPHONY_BRANCH} https://github.com/frappe/telephony --skip-assets
+RUN bench get-app --branch ${HRMS_BRANCH} https://github.com/frappe/hrms --skip-assets
+RUN bench get-app --branch ${HELP_DESK_BRANCH} https://github.com/frappe/helpdesk --skip-assets
+RUN bench get-app --branch ${PRINT_DESIGNER_BRANCH} https://github.com/frappe/print_designer --skip-assets
+RUN bench get-app --branch ${INSIGHTS_BRANCH} https://github.com/frappe/insights --skip-assets
+RUN bench get-app --branch ${DRIVE_BRANCH} https://github.com/frappe/drive --skip-assets
 
 # Build apps individually (step-by-step for memory efficiency)
 RUN bench build --app frappe
@@ -517,7 +629,7 @@ deploy_stack() {
         info "Site ${SITE_NAME} already exists - performing update..."
         # Update existing site
         info "Running bench update for site '${SITE_NAME}'..."
-        if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" update --patch >> "$deploy_log" 2>&1; then
+        if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" migrate >> "$deploy_log" 2>&1; then
             warn "bench update failed - manual intervention may be required. Check $deploy_log"
         else
             info "Site '${SITE_NAME}' updated successfully."
@@ -974,12 +1086,13 @@ case "${1:-}" in
     restore-backup)    cmd_restore_backup "${@}" ;;
     verify_site_health) verify_site_health "$@" ;;
     upgrade)           cmd_upgrade ;;
+	get_latest_version) auto_detect_app_versions ;;
     *) 
         cat <<USAGE
-Usage: $0 [--debug] {deploy|build-custom-image|start|stop|restart|
+Usage: $0 {deploy|build-custom-image|start|stop|restart|
     restore-backup|logs|status|cleanup|force-cleanup|
     rebuild-and-deploy|redeploy|fix-routing|fix-configurator|
-    check_mysql_user|quick-rebuild|health-check|upgrade}
+    check_mysql_user|quick-rebuild|health-check|upgrade|get_latest_version}
 
 Notes:
  - Use --debug as first argument to print loaded env variables.

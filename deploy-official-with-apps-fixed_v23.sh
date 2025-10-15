@@ -5,6 +5,10 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 
+deploy_log="${PROJECT_DIR}/deploy.log"
+: "${deploy_log:=${PROJECT_DIR}/deploy.log}"
+GITHUB_TOKEN=ghp_gbF19xeMV75pUez7yv2Wk797H3Gs22AVM2kchPs
+
 # clean .log
 find "${PROJECT_DIR}" -maxdepth 1 -type f -name "*.log" -exec rm -f {} \;
 
@@ -73,75 +77,141 @@ is_build_complete() {
 
 # ---------- Auto detect latest compatible app versions from GitHub ----------
 auto_detect_app_versions() {
-    local token_header=""
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-        token_header="-H Authorization: token ${GITHUB_TOKEN}"
+    local GITHUB_TOKEN_VALUE="${GITHUB_TOKEN:-}"
+    local token_header=()
+    local using_token=false
+    local UA_HEADER=(-H "User-Agent: frappe-deploy-script")
+
+    if [ -n "${GITHUB_TOKEN_VALUE:-}" ]; then
+        token_header=(-H "Authorization: token ${GITHUB_TOKEN_VALUE}")
+        using_token=true
+        info "Using GitHub token for API requests (pre-checking token health)..."
+        local rl_code
+        rl_code=$(curl -s -o /dev/null -w "%{http_code}" "${token_header[@]}" "${UA_HEADER[@]}" "https://api.github.com/rate_limit" || true)
+        if [ "$rl_code" != "200" ]; then
+            warn "GitHub token test failed (HTTP ${rl_code}). Falling back to anonymous mode."
+            using_token=false
+            token_header=()
+        fi
+    else
+        warn "No GITHUB_TOKEN found, using anonymous mode."
     fi
 
-    # 基础 GitHub API 函数
+    github_api_request() {
+        local url="$1"
+        local response
+        if [ "$using_token" = true ]; then
+            response=$(curl -s "${token_header[@]}" "${UA_HEADER[@]}" "$url" || true)
+        else
+            response=$(curl -s "${UA_HEADER[@]}" "$url" || true)
+        fi
+        echo "$response"
+    }
+
+    safe_jq_names() {
+        # 安全 jq 提取 tags 名称列表，即使空或无效也不会退出脚本
+        jq -r 'try (.[].name) // empty' 2>/dev/null || echo ""
+    }
+
     get_repo_tags() {
         local repo="$1"
-        curl -s $token_header "https://api.github.com/repos/${repo}/tags?per_page=100" | jq -r '.[].name'
+        local body
+        body=$(github_api_request "https://api.github.com/repos/${repo}/tags?per_page=100")
+        local count
+        count=$(echo "$body" | jq 'length' 2>/dev/null || echo 0)
+        info "Fetched ${count} tags for ${repo}"
+        echo "$body" | safe_jq_names
     }
 
     get_repo_branches() {
         local repo="$1"
-        curl -s $token_header "https://api.github.com/repos/${repo}/branches?per_page=100" | jq -r '.[].name'
+        local body
+        body=$(github_api_request "https://api.github.com/repos/${repo}/branches?per_page=100")
+        local count
+        count=$(echo "$body" | jq 'length' 2>/dev/null || echo 0)
+        info "Fetched ${count} branches for ${repo}"
+        echo "$body" | safe_jq_names
     }
 
     get_highest_tag_for_major() {
         local repo="$1"
         local major="$2"
-        get_repo_tags "$repo" | grep -E "^v?${major}\." | sort -V | tail -n1
+        get_repo_tags "$repo" | grep -E "^v?${major}\." | sort -V | tail -n1 || true
     }
 
     get_highest_tag_overall() {
         local repo="$1"
-        get_repo_tags "$repo" | grep -E '^v?[0-9]' | sort -V | tail -n1
+        get_repo_tags "$repo" | grep -E '^v?[0-9]' | sort -V | tail -n1 || true
     }
 
     get_highest_major() {
         local repo="$1"
-        get_repo_tags "$repo" | grep -E '^v?[0-9]+' | sed -E 's/^v?([0-9]+).*/\1/' | sort -n | tail -n1
+        get_repo_tags "$repo" | grep -E '^v?[0-9]+' | sed -E 's/^v?([0-9]+).*/\1/' | sort -n | tail -n1 || true
     }
 
-    # ---------- 检测 frappe/erpnext 主版本 ----------
-    local frappe_major=$(get_highest_major "frappe/frappe")
-    local erpnext_major=$(get_highest_major "frappe/erpnext")
+    # ---------- 检测主版本 ----------
+    local frappe_major erpnext_major major_ver
+    frappe_major="$(get_highest_major "frappe/frappe")"
+    erpnext_major="$(get_highest_major "frappe/erpnext")"
 
-    # 取最大主版本号
-    local major_ver=$(( frappe_major > erpnext_major ? frappe_major : erpnext_major ))
+    if [ -z "${frappe_major:-}" ] || [ -z "${erpnext_major:-}" ]; then
+        warn "Failed to detect frappe/erpnext major versions from GitHub — falling back to Docker Hub."
+        local docker_raw docker_latest docker_major
+        docker_raw="$(curl -s "https://registry.hub.docker.com/v2/repositories/frappe/erpnext/tags?page_size=100" || true)"
+        docker_latest="$(echo "$docker_raw" | jq -r '.results[]?.name' 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+        if [ -n "${docker_latest:-}" ]; then
+            docker_major="$(echo "$docker_latest" | sed -E 's/^v([0-9]+)\..*/\1/' || true)"
+            info "Using Docker Hub ERPNext tag ${docker_latest} (major v${docker_major})"
+            frappe_major="${docker_major}"
+            erpnext_major="${docker_major}"
+        else
+            warn "No valid Docker Hub tag found. Defaulting to v15."
+            frappe_major=15
+            erpnext_major=15
+        fi
+    fi
 
+    major_ver=$(( frappe_major > erpnext_major ? frappe_major : erpnext_major ))
     info "🔍 Detected latest major version: v${major_ver}"
 
-    # ---------- 匹配各 App ----------
-    FRAPPE_BRANCH=$(get_highest_tag_for_major "frappe/frappe" "$major_ver")
-    ERPNEXT_BRANCH=$(get_highest_tag_for_major "frappe/erpnext" "$major_ver")
+    # ---------- 各 App ----------
+    FRAPPE_BRANCH="$(get_highest_tag_for_major "frappe/frappe" "$major_ver")"
+    ERPNEXT_BRANCH="$(get_highest_tag_for_major "frappe/erpnext" "$major_ver")"
 
-    # HRMS：找 version-xx 分支
-    local hrms_branches=$(get_repo_branches "frappe/hrms")
-    local target_branch="version-${major_ver}"
-    local prev_branch="version-$((major_ver - 1))"
+    local hrms_branches target_branch prev_branch
+    hrms_branches="$(get_repo_branches "frappe/hrms")"
+    target_branch="version-${major_ver}"
+    prev_branch="version-$((major_ver - 1))"
 
-    if echo "$hrms_branches" | grep -q "^${target_branch}$"; then
+    if echo "${hrms_branches:-}" | grep -q "^${target_branch}$"; then
         HRMS_BRANCH="${target_branch}"
-    elif echo "$hrms_branches" | grep -q "^${prev_branch}$"; then
+    elif echo "${hrms_branches:-}" | grep -q "^${prev_branch}$"; then
         HRMS_BRANCH="${prev_branch}"
     else
-        HRMS_BRANCH=$(get_highest_tag_overall "frappe/hrms")
+        HRMS_BRANCH="$(get_highest_tag_overall "frappe/hrms")"
     fi
 
     TELEPHONY_BRANCH="develop"
-    HELP_DESK_BRANCH=$(get_highest_tag_overall "frappe/helpdesk")
-    PRINT_DESIGNER_BRANCH=$(get_highest_tag_overall "frappe/print_designer")
-    INSIGHTS_BRANCH=$(get_highest_tag_overall "frappe/insights")
-    DRIVE_BRANCH=$(get_highest_tag_overall "frappe/drive")
-	CUSTOM_IMAGE="my-erpnext-v${major_ver}--custom"
-	
-    export FRAPPE_BRANCH ERPNEXT_BRANCH HRMS_BRANCH TELEPHONY_BRANCH HELP_DESK_BRANCH PRINT_DESIGNER_BRANCH INSIGHTS_BRANCH DRIVE_BRANCH CUSTOM_IMAGE
+    HELP_DESK_BRANCH="$(get_highest_tag_overall "frappe/helpdesk")"
+    PRINT_DESIGNER_BRANCH="$(get_highest_tag_overall "frappe/print_designer")"
+    INSIGHTS_BRANCH="$(get_highest_tag_overall "frappe/insights")"
+    DRIVE_BRANCH="$(get_highest_tag_overall "frappe/drive")"
 
-    # ---------- 输出 ----------
-    info "✅ Auto-selected versions from GitHub (aligned with v${major_ver}):"
+    # fallback 默认值（保证生产稳定）
+    if [ -z "${FRAPPE_BRANCH:-}" ]; then FRAPPE_BRANCH="v${major_ver}.x-latest"; fi
+    if [ -z "${ERPNEXT_BRANCH:-}" ]; then ERPNEXT_BRANCH="v${major_ver}.x-latest"; fi
+    if [ -z "${HRMS_BRANCH:-}" ]; then HRMS_BRANCH="develop"; fi
+    if [ -z "${HELP_DESK_BRANCH:-}" ]; then HELP_DESK_BRANCH="develop"; fi
+    if [ -z "${PRINT_DESIGNER_BRANCH:-}" ]; then PRINT_DESIGNER_BRANCH="develop"; fi
+    if [ -z "${INSIGHTS_BRANCH:-}" ]; then INSIGHTS_BRANCH="develop"; fi
+    if [ -z "${DRIVE_BRANCH:-}" ]; then DRIVE_BRANCH="develop"; fi
+
+    CUSTOM_IMAGE="my-erpnext-v${major_ver}-custom"
+
+    export FRAPPE_BRANCH ERPNEXT_BRANCH HRMS_BRANCH TELEPHONY_BRANCH HELP_DESK_BRANCH \
+           PRINT_DESIGNER_BRANCH INSIGHTS_BRANCH DRIVE_BRANCH CUSTOM_IMAGE
+
+    info "✅ Auto-selected versions (aligned with v${major_ver}):"
     echo "  FRAPPE_BRANCH=${FRAPPE_BRANCH}"
     echo "  ERPNEXT_BRANCH=${ERPNEXT_BRANCH}"
     echo "  HRMS_BRANCH=${HRMS_BRANCH}"
@@ -150,7 +220,57 @@ auto_detect_app_versions() {
     echo "  PRINT_DESIGNER_BRANCH=${PRINT_DESIGNER_BRANCH}"
     echo "  INSIGHTS_BRANCH=${INSIGHTS_BRANCH}"
     echo "  DRIVE_BRANCH=${DRIVE_BRANCH}"
-	echo "  CUSTOM_IMAGE=${CUSTOM_IMAGE}"
+    echo "  CUSTOM_IMAGE=${CUSTOM_IMAGE}"
+}
+
+
+# ---------- Check app versions against .env ----------
+check_app_versions() {
+    info "Checking app versions against .env..."
+
+    # Get latest versions from GitHub
+    auto_detect_app_versions
+
+    # Define expected versions from GitHub
+    local github_versions=(
+        "FRAPPE_BRANCH=${FRAPPE_BRANCH}"
+        "ERPNEXT_BRANCH=${ERPNEXT_BRANCH}"
+        "HRMS_BRANCH=${HRMS_BRANCH}"
+        "TELEPHONY_BRANCH=${TELEPHONY_BRANCH}"
+        "HELP_DESK_BRANCH=${HELP_DESK_BRANCH}"
+        "PRINT_DESIGNER_BRANCH=${PRINT_DESIGNER_BRANCH}"
+        "INSIGHTS_BRANCH=${INSIGHTS_BRANCH}"
+        "DRIVE_BRANCH=${DRIVE_BRANCH}"
+        "CUSTOM_IMAGE=${CUSTOM_IMAGE}"
+    )
+
+    local env_versions=()
+    local needs_update=false
+
+    # Read current .env versions
+    for version in "${github_versions[@]}"; do
+        local key="${version%%=*}"
+        local github_value="${version#*=}"
+        local env_value=$(grep "^${key}=" "$ENV_FILE" | cut -d'=' -f2-)
+
+        if [ -z "$env_value" ]; then
+            info "Version for ${key} not found in .env, update required"
+            needs_update=true
+            break
+        elif [ "$env_value" != "$github_value" ]; then
+            info "Version mismatch for ${key}: .env=${env_value}, GitHub=${github_value}"
+            needs_update=true
+            break
+        fi
+    done
+
+    if [ "$needs_update" = false ]; then
+        info "All app versions match .env, no update required"
+        return 1
+    else
+        info "Version mismatch detected, proceeding with build and deploy"
+        return 0
+    fi
 }
 
 # ---------- Generate Dockerfile.custom ----------
@@ -158,15 +278,36 @@ generate_custom_dockerfile() {
     info "Generating Dockerfile.custom..."
     local erpnext_ver="${ERPNEXT_VERSION:-${BASE_TAG}}"
     local github_erpnext_ver="${GITHUB_ERPNEXT_VERSION:-${erpnext_ver}}"
-    
+
+    # ---------- 从 Docker Hub 获取最新大版本号 ----------
+    local docker_raw latest_tag major_tag
+    docker_raw=$(curl -s "https://registry.hub.docker.com/v2/repositories/frappe/erpnext/tags?page_size=100")
+
+    # 获取最新 tag (vX.Y.Z)
+    latest_tag=$(echo "$docker_raw" \
+        | jq -r '.results[]?.name' \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sort -V \
+        | tail -n1)
+	erpnext_ver="${latest_tag:-${BASE_TAG}}"
+	echo "the docker hub erpnext version is :$latest_tag"
+	
     # 提取版本号（移除 "v" 前缀以便比较）
     local erpnext_ver_num=$(echo "$erpnext_ver" | sed 's/^v//')
     local github_ver_num=$(echo "$github_erpnext_ver" | sed 's/^v//')
 
     # 比较 ERPNEXT_VERSION 和 GITHUB_ERPNEXT_VERSION：如果 github_ver_num > erpnext_ver_num，则用 GitHub
     local use_github=false
-    if [ "$(printf '%s\n' "$github_ver_num" "$erpnext_ver_num" | sort -V | tail -n1)" = "$github_ver_num" ]; then
+	
+    if [ "$github_ver_num" = "$erpnext_ver_num" ]; then
+        use_github=false
+    elif [ "$(printf '%s\n' "$github_ver_num" "$erpnext_ver_num" | sort -V | tail -n1)" = "$github_ver_num" ]; then
         use_github=true
+    else
+        use_github=false
+    fi
+
+    if [[ "$use_github" == true ]]; then
         info "GitHub erpnext version (${github_erpnext_ver}) is newer than Docker Hub version (${erpnext_ver}), using GitHub source."
     else
         info "Docker Hub erpnext version (${erpnext_ver}) is equal or newer, attempting to use Docker Hub."
@@ -244,7 +385,7 @@ EOF
             touch "$ENV_FILE"
         fi
 
-        # 删除旧的 ERPNEXT_VERSION / GITHUB_ERPNEXT_VERSION 行
+        # 删除旧的版本行
 		sed -i '/^CUSTOM_IMAGE=/d' "$ENV_FILE"
         sed -i '/^FRAPPE_VERSION=/d' "$ENV_FILE"		
         sed -i '/^ERPNEXT_VERSION=/d' "$ENV_FILE"
@@ -258,7 +399,7 @@ EOF
         # 写入新的版本信息
         {
             echo "FRAPPE_VERSION=${FRAPPE_BRANCH}"
-            echo "ERPNEXT_VERSION=${final_erpnext_version}"
+            echo "ERPNEXT_VERSION=${erpnext_ver}"
             echo "GITHUB_ERPNEXT_VERSION=${github_erpnext_ver}"
             echo "HRMS_BRANCH=${HRMS_BRANCH}"
             echo "TELEPHONY_BRANCH=${TELEPHONY_BRANCH}"
@@ -393,7 +534,7 @@ check_mysql_user() {
         return 1
     fi
 	
-    #  检查是否存在 SaaS 限制字段 user_type_doctype_limit，并清理
+    # 检查是否存在 SaaS 限制字段 user_type_doctype_limit，并清理
     if docker compose ${compose_files} --env-file .env exec -T backend grep -q '"user_type_doctype_limit"' "sites/${site_name}/site_config.json"; then
         info "Removing SaaS restriction field 'user_type_doctype_limit' from site_config.json..."
 
@@ -1045,7 +1186,14 @@ cmd_upgrade() {
         return 1
     fi
 
-    # Step 1: Build custom image
+    # Step 1: Check app versions
+    if ! check_app_versions; then
+        info "No version updates required, skipping build and deploy."
+        echo "[$(date)] No version updates required for site '${SITE_NAME}'" >> "$deploy_log"
+        return 0
+    fi
+
+    # Step 2: Build custom image
     info "Building custom image for upgrade..."
     cmd_build_custom_image
     if [ $? -ne 0 ]; then
@@ -1053,7 +1201,7 @@ cmd_upgrade() {
         exit 1
     fi
 
-    # Step 2: Deploy with update
+    # Step 3: Deploy with update
     info "Deploying and upgrading site '${SITE_NAME}'..."
     cmd_deploy
     if [ $? -ne 0 ]; then
@@ -1099,7 +1247,7 @@ Notes:
  - quick-rebuild [--force|--no-pull]: Enhanced rebuild with cache retention; forces no-cache if incomplete or --force; --no-pull skips base image pull.
  - health-check [--strict] [SITE_NAME] [LOG_FILE]: Run standalone site health check (apps, scheduler, assets, DB). Use --strict for production monitoring (exits 1 on failure).
  - After quick-rebuild, a bench doctor run is performed and the log is saved as ./doctor_<TAG>.log if issues are found.
- - upgrade: Rebuilds custom image and upgrades the site with data migration.
+ - upgrade: Rebuilds custom image and upgrades the site with data migration, only if app versions differ from .env.
  - To fully reset DB/volumes in dev: $0 force-cleanup
  - Make sure .env contains MYSQL_ROOT_PASSWORD and DB_PASSWORD
 USAGE

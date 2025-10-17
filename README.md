@@ -1,20 +1,18 @@
 # ERPNext_OneKey
-get_latest_version
 
-  FRAPPE_BRANCH=v15.85.1
-  
-  ERPNEXT_BRANCH=v15.83.0
-  
-  HRMS_BRANCH=v15.51.0
-  
-  TELEPHONY_BRANCH=develop
-  
-  HELP_DESK_BRANCH=v1.15.1
-  
-  PRINT_DESIGNER_BRANCH=v1.6.2
-  
-  INSIGHTS_BRANCH=v3.2.11
-  
-  DRIVE_BRANCH=v0.3.0
-  
-  CUSTOM_IMAGE=my-erpnext-v15--custom
+===== App Version Comparison =====
+
+App             Stable Mode        Latest Mode        Suggested          Changed
+----------------------------------------------------------------------------------------
+insights        v3.2.11            v3.2.11            v3.2.11            -
+builder         v1.20.1            v1.20.1            v1.20.1            -
+erpnext         v15.83.0           v15.83.0           v15.83.0           -
+wiki            v2.0.1             v2.0.1             v2.0.1             -
+helpdesk        v1.15.1            v1.15.1            v1.15.1            -
+lms             v2.39.0            v2.39.0            v2.39.0            -
+frappe          v15.86.0           v15.86.0           v15.86.0           -
+hrms            v15.51.0           v15.51.0           v15.51.0           -
+drive           v0.3.0             v0.3.0             v0.3.0             -
+print_designer  v1.6.2             v1.6.2             v1.6.2             -
+telephony       develop            develop            develop            -
+==================================

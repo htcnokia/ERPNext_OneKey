@@ -1,21 +1,77 @@
 #!/bin/bash
 : "${ERPNEXT_VERSION:=v15.83.0}"
 set -euo pipefail
-
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 
 deploy_log="${PROJECT_DIR}/deploy.log"
 : "${deploy_log:=${PROJECT_DIR}/deploy.log}"
-GITHUB_TOKEN=ghp_3bF619xe5MV7pUez6byv246fdkc77H3Gi9s2AV0M20kc6hPsg61po3f
-
-# clean .log
-find "${PROJECT_DIR}" -maxdepth 1 -type f -name "*.log" -exec rm -f {} \;
+GITHUB_TOKEN="${GITHUB_TOKEN:-ghp_gbzbyv2Wk77H3Gs22kchPs}"
 
 # ---------- Logging ----------
 info()  { echo -e "\033[1;32m[INFO]\033[0m  $*"; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
 error() { echo -e "\033[1;31m[ERROR]\033[0m $*"; }
+
+# clean .log
+find "${PROJECT_DIR}" -maxdepth 1 -type f -name "*.log" -exec rm -f {} \;
+
+# Check available memory and swap
+MEM_AVAILABLE=$(free -m | awk '/^Mem:/{print $2}')
+MEM_THRESHOLD=$((16 * 1024))  # 16GB in MB
+SWAP_AVAILABLE=$(free -m | awk '/^Swap:/{print $2}')
+SWAP_THRESHOLD=4096  # 4GB
+if [ "$MEM_AVAILABLE" -lt "$MEM_THRESHOLD" ]; then
+    echo "Error: Insufficient memory. Available: $((MEM_AVAILABLE / 1024))GB, Required: 16GB"
+    exit 1
+fi
+if [ "$SWAP_AVAILABLE" -lt "$SWAP_THRESHOLD" ]; then
+    echo "Error: Insufficient swap space. Available: ${SWAP_AVAILABLE}MB, Required: ${SWAP_THRESHOLD}MB"
+    exit 1
+fi
+
+# Check disk space
+DISK_AVAILABLE=$(df -m /tmp | awk 'NR==2 {print $4}')
+DISK_THRESHOLD=10240  # 10GB
+if [ "$DISK_AVAILABLE" -lt "$DISK_THRESHOLD" ]; then
+    echo "Error: Insufficient disk space in /tmp. Available: ${DISK_AVAILABLE}MB, Required: ${DISK_THRESHOLD}MB"
+    exit 1
+fi
+
+send_alert() {
+    local message="$1"
+    local corpid="${WECHAT_CORPID:-123456}"
+    local agentid="${WECHAT_AGENTID:-128}"
+    local secret="${WECHAT_SECRET:-5256332225556222fzQ}"
+    local touser="${WECHAT_TOUSER:-user1}"  # Default to 'user1', override in .env
+
+    # Get access token
+    local token_url="https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${corpid}&corpsecret=${secret}"
+    local token_response
+    token_response=$(curl -s "$token_url")
+    local access_token
+    access_token=$(echo "$token_response" | jq -r '.access_token // empty')
+    if [ -z "$access_token" ]; then
+        warn "Failed to get WeChat access token: $(echo "$token_response" | jq -r '.errmsg // "Unknown error"')"
+        return 1
+    fi
+
+    # Send message
+    local send_url="https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${access_token}"
+    local payload
+    payload=$(jq -n --arg touser "$touser" --arg agentid "$agentid" --arg msg "$message" \
+        '{touser: $touser, msgtype: "text", agentid: ($agentid | tonumber), text: {content: $msg}, safe: 0}')
+    local send_response
+    send_response=$(curl -s -X POST -H "Content-Type: application/json" -d "$payload" "$send_url")
+    local errcode
+    errcode=$(echo "$send_response" | jq -r '.errcode // -1')
+    if [ "$errcode" -ne 0 ]; then
+        warn "Failed to send WeChat message: $(echo "$send_response" | jq -r '.errmsg // "Unknown error"')"
+        return 1
+    fi
+
+    info "WeChat message sent to ${touser}"
+}
 
 # ---------- Utility: load .env safely ----------
 load_env_file() {
@@ -196,20 +252,30 @@ auto_detect_app_versions() {
     PRINT_DESIGNER_BRANCH="$(get_highest_tag_overall "frappe/print_designer")"
     INSIGHTS_BRANCH="$(get_highest_tag_overall "frappe/insights")"
     DRIVE_BRANCH="$(get_highest_tag_overall "frappe/drive")"
-
+    # -------- 新增 App 检测 --------
+    # WIKI_BRANCH="$(get_highest_tag_overall "frappe/wiki")"
+    LMS_BRANCH="$(get_highest_tag_overall "frappe/lms")"
+    BUILDER_BRANCH="$(get_highest_tag_overall "frappe/builder")"
+	
     # fallback 默认值（保证生产稳定）
     if [ -z "${FRAPPE_BRANCH:-}" ]; then FRAPPE_BRANCH="v${major_ver}.x-latest"; fi
     if [ -z "${ERPNEXT_BRANCH:-}" ]; then ERPNEXT_BRANCH="v${major_ver}.x-latest"; fi
-    if [ -z "${HRMS_BRANCH:-}" ]; then HRMS_BRANCH="develop"; fi
-    if [ -z "${HELP_DESK_BRANCH:-}" ]; then HELP_DESK_BRANCH="develop"; fi
-    if [ -z "${PRINT_DESIGNER_BRANCH:-}" ]; then PRINT_DESIGNER_BRANCH="develop"; fi
-    if [ -z "${INSIGHTS_BRANCH:-}" ]; then INSIGHTS_BRANCH="develop"; fi
-    if [ -z "${DRIVE_BRANCH:-}" ]; then DRIVE_BRANCH="develop"; fi
+    if [ -z "${HRMS_BRANCH:-}" ]; then HRMS_BRANCH="v15.51.0"; fi
+    if [ -z "${HELP_DESK_BRANCH:-}" ]; then HELP_DESK_BRANCH="v1.15.1"; fi
+    if [ -z "${PRINT_DESIGNER_BRANCH:-}" ]; then PRINT_DESIGNER_BRANCH="v1.6.2"; fi
+    if [ -z "${INSIGHTS_BRANCH:-}" ]; then INSIGHTS_BRANCH="v3.2.11"; fi
+    if [ -z "${DRIVE_BRANCH:-}" ]; then DRIVE_BRANCH="v0.3.0"; fi
+    if [ -z "${WIKI_BRANCH:-}" ]; then WIKI_BRANCH="develop"; fi
+    if [ -z "${LMS_BRANCH:-}" ]; then LMS_BRANCH="v2.39.0"; fi
+    if [ -z "${BUILDER_BRANCH:-}" ]; then BUILDER_BRANCH="v1.20.1"; fi
 
     CUSTOM_IMAGE="my-erpnext-v${major_ver}-custom"
-
+    # --锁定特殊app ---
+	WIKI_BRANCH="develop"
+	
     export FRAPPE_BRANCH ERPNEXT_BRANCH HRMS_BRANCH TELEPHONY_BRANCH HELP_DESK_BRANCH \
-           PRINT_DESIGNER_BRANCH INSIGHTS_BRANCH DRIVE_BRANCH CUSTOM_IMAGE
+           PRINT_DESIGNER_BRANCH INSIGHTS_BRANCH DRIVE_BRANCH CUSTOM_IMAGE \
+           WIKI_BRANCH LMS_BRANCH BUILDER_BRANCH
 
     info "✅ Auto-selected versions (aligned with v${major_ver}):"
     echo "  FRAPPE_BRANCH=${FRAPPE_BRANCH}"
@@ -220,6 +286,9 @@ auto_detect_app_versions() {
     echo "  PRINT_DESIGNER_BRANCH=${PRINT_DESIGNER_BRANCH}"
     echo "  INSIGHTS_BRANCH=${INSIGHTS_BRANCH}"
     echo "  DRIVE_BRANCH=${DRIVE_BRANCH}"
+    echo "  WIKI_BRANCH=${WIKI_BRANCH}"
+    echo "  LMS_BRANCH=${LMS_BRANCH}"
+    echo "  BUILDER_BRANCH=${BUILDER_BRANCH}"
     echo "  CUSTOM_IMAGE=${CUSTOM_IMAGE}"
 }
 
@@ -241,6 +310,9 @@ check_app_versions() {
         "PRINT_DESIGNER_BRANCH=${PRINT_DESIGNER_BRANCH}"
         "INSIGHTS_BRANCH=${INSIGHTS_BRANCH}"
         "DRIVE_BRANCH=${DRIVE_BRANCH}"
+        "WIKI_BRANCH=${WIKI_BRANCH}"
+        "LMS_BRANCH=${LMS_BRANCH}"
+        "BUILDER_BRANCH=${BUILDER_BRANCH}"		
         "CUSTOM_IMAGE=${CUSTOM_IMAGE}"
     )
 
@@ -274,20 +346,19 @@ check_app_versions() {
 }
 
 # ---------- Generate Dockerfile.custom ----------
-
 generate_custom_dockerfile() {
     info "Generating Dockerfile.custom..."
     local erpnext_ver="${ERPNEXT_VERSION:-${BASE_TAG}}"
     local github_erpnext_ver="${GITHUB_ERPNEXT_VERSION:-${erpnext_ver}}"
 
-    # ---------- 获取 Docker Hub 最新大版本 ----------
+    # 获取 Docker Hub 最新大版本
     local docker_raw latest_tag
     docker_raw=$(curl -s "https://registry.hub.docker.com/v2/repositories/frappe/erpnext/tags?page_size=100")
     latest_tag=$(echo "$docker_raw" | jq -r '.results[]?.name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
     erpnext_ver="${latest_tag:-${BASE_TAG}}"
     echo "Docker Hub ERPNext latest version: $latest_tag"
 
-    # ---------- 版本比较 ----------
+    # 版本比较
     local erpnext_ver_num=$(echo "$erpnext_ver" | sed 's/^v//')
     local github_ver_num=$(echo "$github_erpnext_ver" | sed 's/^v//')
     local use_github=false
@@ -295,7 +366,7 @@ generate_custom_dockerfile() {
         use_github=true
     fi
 
-    # ---------- 检查 wheels ----------
+    # 检查 wheels
     local wheels_copy=""
     if [ -d "$PROJECT_DIR/wheels" ]; then
         local wheel_files=("$PROJECT_DIR/wheels"/*.whl)
@@ -306,7 +377,7 @@ RUN pip install --no-cache-dir /wheels/*.whl"
         fi
     fi
 
-    # ---------- 设置基础镜像 ----------
+    # 设置基础镜像
     local from_line="FROM frappe/erpnext:${erpnext_ver}"
     local extra_clone=""
     if [ "$use_github" = true ]; then
@@ -322,16 +393,21 @@ RUN npm install -g npm@latest && npm install esbuild@latest && npx update-browse
         info "Using Docker Hub image for ERPNext: ${erpnext_ver}"
     fi
 
-    # ---------- 生成 Dockerfile ----------
+    # 生成 Dockerfile
     cat > Dockerfile.custom <<EOF
 ARG ERPNEXT_VERSION=${erpnext_ver}
 $from_line
 
-ENV NODE_OPTIONS="--max-old-space-size=8192"
+ENV NODE_OPTIONS="--max-old-space-size=12288"
+ENV FRAPPE_REDIS_NO_SEARCH=1
 
 USER root
-RUN apt-get update && apt-get install -y git pkg-config default-libmysqlclient-dev build-essential mariadb-client curl unzip jq chromium chromium-chromedriver traceroute && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git pkg-config default-libmysqlclient-dev build-essential mariadb-client curl unzip jq \
+    && pip install --no-cache-dir wechatpy apprise \
+    && rm -rf /var/lib/apt/lists/*
+
 $wheels_copy
+
 USER frappe
 WORKDIR /home/frappe/frappe-bench
 
@@ -339,26 +415,44 @@ $extra_clone
 
 RUN mkdir -p sites && echo '{"socketio_port": 9000}' > sites/common_site_config.json
 
-# Download / get additional apps (step-by-step for caching and memory)
-RUN bench get-app --branch ${TELEPHONY_BRANCH} https://github.com/frappe/telephony --skip-assets
-RUN bench get-app --branch ${HRMS_BRANCH} https://github.com/frappe/hrms --skip-assets
-RUN bench get-app --branch ${HELP_DESK_BRANCH} https://github.com/frappe/helpdesk --skip-assets
-RUN bench get-app --branch ${PRINT_DESIGNER_BRANCH} https://github.com/frappe/print_designer --skip-assets
-RUN bench get-app --branch ${INSIGHTS_BRANCH} https://github.com/frappe/insights --skip-assets
-RUN bench get-app --branch ${DRIVE_BRANCH} https://github.com/frappe/drive --skip-assets
+# Download apps
+RUN bench get-app --branch ${TELEPHONY_BRANCH} https://github.com/frappe/telephony --skip-assets \
+    && bench get-app --branch ${HRMS_BRANCH} https://github.com/frappe/hrms --skip-assets \
+    && bench get-app --branch ${HELP_DESK_BRANCH} https://github.com/frappe/helpdesk --skip-assets \
+    && bench get-app --branch ${PRINT_DESIGNER_BRANCH} https://github.com/frappe/print_designer --skip-assets \
+    && bench get-app --branch ${INSIGHTS_BRANCH} https://github.com/frappe/insights --skip-assets \
+    && bench get-app --branch ${DRIVE_BRANCH} https://github.com/frappe/drive --skip-assets \
+    && bench get-app --branch develop https://github.com/frappe/wiki --skip-assets \
+    && bench get-app --branch ${LMS_BRANCH} https://github.com/frappe/lms --skip-assets \
+    && bench get-app --branch ${BUILDER_BRANCH} https://github.com/frappe/builder --skip-assets
 
-# Build apps individually (step-by-step for memory efficiency)
-RUN bench build --app frappe
-RUN bench build --app erpnext
-RUN bench build --app telephony
-RUN bench build --app print_designer
-RUN bench build --app helpdesk
-RUN bench build --app insights
-RUN bench build --app drive
+# Install app dependencies
+RUN if [ -f /home/frappe/frappe-bench/apps/wiki/requirements.txt ]; then pip install --no-cache-dir -r /home/frappe/frappe-bench/apps/wiki/requirements.txt; fi \
+    && if [ -f /home/frappe/frappe-bench/apps/lms/requirements.txt ]; then pip install --no-cache-dir -r /home/frappe/frappe-bench/apps/lms/requirements.txt; fi \
+    && if [ -f /home/frappe/frappe-bench/apps/builder/requirements.txt ]; then pip install --no-cache-dir -r /home/frappe/frappe-bench/apps/builder/requirements.txt; fi \
+    && pip install --no-cache-dir pandas==2.2.2 beautifulsoup4==4.13.4 Markdown==3.8.2 redis==4.5.4
 
+# Install Node.js dependencies
+RUN cd /home/frappe/frappe-bench/apps/lms && yarn install --check-files \
+    && cd frontend && yarn install --check-files \
+    && yarn add @tiptap/core@2.7.0 sortablejs@1.14.0 workbox-build@7.3.0 workbox-window@7.3.0 highlight.js@11.0.0
+RUN cd /home/frappe/frappe-bench/apps/builder && yarn install --check-files \
+    && cd frontend && yarn install --check-files \
+    && yarn add @tiptap/core@2.7.0 sortablejs@1.14.0 workbox-build@7.3.0 workbox-window@7.3.0 highlight.js@11.0.0
+
+# Build apps
+RUN bench build --app frappe --verbose || { cat /home/frappe/frappe-bench/logs/*; exit 1; } \
+    && bench build --app erpnext \
+    && bench build --app telephony \
+    && bench build --app print_designer \
+    && bench build --app helpdesk \
+    && bench build --app insights \
+    && bench build --app drive \
+    && bench build --app wiki --verbose || { cat /home/frappe/frappe-bench/logs/*; exit 1; } \
+    && bench build --app lms --verbose || { cat /home/frappe/frappe-bench/logs/*; exit 1; } \
+    && bench build --app builder
 EOF
 }
-
 
 # ---------- Build custom image ----------
 build_custom_image() {
@@ -370,7 +464,7 @@ build_custom_image() {
     build_opts=(--pull "${build_opts[@]}")
 
     docker build "${build_opts[@]}" .
-
+    send_alert "Built image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}"
     info "Built image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}"
     # update .env to persist custom image usage if desired
     if grep -q '^CUSTOM_IMAGE=' "$ENV_FILE"; then
@@ -656,7 +750,7 @@ deploy_stack() {
 
         # Install apps with retry
         local install_success=true
-        for app in frappe erpnext telephony hrms helpdesk print_designer insights drive; do
+        for app in frappe erpnext telephony hrms helpdesk print_designer insights drive wiki lms builder; do
             info "Attempting to install app: ${app} (with retry if needed)"
             if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" install-app "${app}" >> "$deploy_log" 2>&1; then
                 info "Retry installing ${app}..."
@@ -714,12 +808,60 @@ deploy_stack() {
     check_mysql_user
     info "Deployment completed - Production Ready ✅"
     echo "[$(date)] Deployment successful for site '${SITE_NAME}'" >> "$deploy_log"
+	send_alert "[$(date)] Deployment successful for site '${SITE_NAME}'"
 }
 
 # ---------- Helper: check required files ----------
 check_required_files() {
-    [ -f "${ENV_FILE}" ] || (error ".env missing" && exit 1)
-    [ -f "compose.yaml" ] || [ -f "docker-compose.yml" ] || (error "compose.yaml or docker-compose.yml missing" && exit 1)
+    local compose_files
+    compose_files=$(get_compose_files)
+    local missing_files=()
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+
+    # Check for .env file
+    if [ ! -f "$ENV_FILE" ]; then
+        missing_files+=("$ENV_FILE")
+    elif [ ! -r "$ENV_FILE" ]; then
+        missing_files+=("$ENV_FILE (not readable)")
+    fi
+
+    # Check for required Docker Compose files
+    local file
+    for file in $(echo "$compose_files" | tr ' ' '\n' | grep -o '\-f \S*' | cut -d' ' -f2); do
+        if [ ! -f "$file" ]; then
+            missing_files+=("$file")
+        elif [ ! -r "$file" ]; then
+            missing_files+=("$file (not readable)")
+        fi
+    done
+
+    # Check for optional wheels directory if it exists
+    if [ -d "$PROJECT_DIR/wheels" ] && [ -z "$(ls -A "$PROJECT_DIR/wheels"/*.whl 2>/dev/null)" ]; then
+        warn "Wheels directory exists but contains no .whl files: $PROJECT_DIR/wheels"
+    fi
+
+    # Verify key environment variables in .env
+    local required_vars=("MYSQL_ROOT_PASSWORD" "WECHAT_CORPID" "WECHAT_AGENTID" "WECHAT_SECRET" "WECHAT_TOUSER")
+    local missing_vars=()
+    for var in "${required_vars[@]}"; do
+        if ! grep -q "^${var}=" "$ENV_FILE"; then
+            missing_vars+=("$var")
+        fi
+    done
+
+    if [ ${#missing_vars[@]} -gt 0 ]; then
+        error "Required environment variables missing in $ENV_FILE: ${missing_vars[*]}"
+        send_alert "Deployment failed for ${SITE_NAME}: Missing environment variables: ${missing_vars[*]}. Check $deploy_log"
+        exit 1
+    fi
+
+    if [ ${#missing_files[@]} -gt 0 ]; then
+        error "Required files are missing or not readable: ${missing_files[*]}"
+        send_alert "Deployment failed for ${SITE_NAME}: Missing required files: ${missing_files[*]}. Check $deploy_log"
+        exit 1
+    fi
+
+    info "All required files and environment variables verified successfully"
 }
 
 # ---------- Commands ----------
@@ -951,6 +1093,46 @@ cmd_restore_backup() {
     info "Restore completed - site '${SITE_NAME}' is ready ✅"
     echo "[$(date)] Restore successful for site '${SITE_NAME}' using backup '${selected_backup}'" >> "$deploy_log"
 }
+cmd_backup() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    local site_name="${SITE_NAME}"
+
+    # Check container disk space
+    local container_disk
+    container_disk=$(docker compose ${compose_files} --env-file .env exec -T backend df -m /home/frappe/frappe-bench/sites | awk 'NR==2 {print $4}' 2>/dev/null || echo "unknown")
+    if [ "$container_disk" != "unknown" ] && [ "$container_disk" -lt 1024 ]; then
+        warn "Low disk space in backend container: ${container_disk}MB available. Clearing container backups..."
+        docker compose ${compose_files} --env-file .env exec -T backend rm -rf "sites/${site_name}/private/backups/*" >> "$deploy_log" 2>&1 || warn "Failed to clear container backups"
+    fi
+
+    info "Backing up site '${site_name}'..."
+    if docker compose ${compose_files} --env-file .env exec -T backend bench --site "${site_name}" backup >> "$deploy_log" 2>&1; then
+        info "Backup created in container: sites/${site_name}/private/backups/$(date +%Y%m%d_%H%M%S)-${site_name}.tar.xz"
+        mkdir -p "${PROJECT_DIR}/backups"
+        local backup_dir="sites/${site_name}/private/backups"
+        local latest_timestamp
+        latest_timestamp=$(docker compose ${compose_files} --env-file .env exec -T backend ls -t "${backup_dir}" | grep -E "^[0-9]{8}_[0-9]{6}-${site_name}" | head -n 1 | cut -d'-' -f1)
+        if [ -n "$latest_timestamp" ]; then
+            docker compose ${compose_files} --env-file .env cp backend:/home/frappe/frappe-bench/${backup_dir}/${latest_timestamp}-${site_name}-database.sql.gz "${PROJECT_DIR}/backups/" || warn "Failed to copy database backup to host"
+            docker compose ${compose_files} --env-file .env cp backend:/home/frappe/frappe-bench/${backup_dir}/${latest_timestamp}-${site_name}-site_config_backup.json "${PROJECT_DIR}/backups/" || warn "Failed to copy site config backup to host"
+            info "Backup files copied to host: ${PROJECT_DIR}/backups/ (${latest_timestamp}-${site_name}-*)"
+            if docker compose ${compose_files} --env-file .env exec -T backend rm -rf "${backup_dir}/*" >> "$deploy_log" 2>&1; then
+                info "Container backup files cleared successfully: ${backup_dir}/*"
+            else
+                warn "Failed to clear container backup files - check $deploy_log for details."
+            fi
+        else
+            warn "No backup files found in container - check $deploy_log"
+            echo "[$(date)] No backup files found for site '${site_name}'" >> "$deploy_log"
+        fi
+    else
+        error "Backup failed - check $deploy_log for details."
+        send_alert "Backup failed for ${site_name}. Check $deploy_log"
+        exit 1
+    fi
+}
 cmd_fix_routing() {
     local compose_files
     compose_files=$(get_compose_files)
@@ -1146,7 +1328,7 @@ case "${1:-}" in
     restore-backup)    cmd_restore_backup "${@}" ;;
     verify_site_health) verify_site_health "$@" ;;
     upgrade)           cmd_upgrade ;;
-	get_latest_version) auto_detect_app_versions ;;
+	get_latest_version) auto_detect_app_versions "$@" ;;
     *) 
         cat <<USAGE
 Usage: $0 {deploy|build-custom-image|start|stop|restart|

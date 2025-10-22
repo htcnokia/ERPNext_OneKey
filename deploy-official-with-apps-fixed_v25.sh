@@ -1,12 +1,11 @@
 #!/bin/bash
-: "${ERPNEXT_VERSION:=v15.83.0}"
+
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 
 deploy_log="${PROJECT_DIR}/deploy.log"
 : "${deploy_log:=${PROJECT_DIR}/deploy.log}"
-GITHUB_TOKEN="${GITHUB_TOKEN:-ghp_gbzbyv2Wk77H3Gs22kchPs}"
 
 # ---------- Logging ----------
 info()  { echo -e "\033[1;32m[INFO]\033[0m  $*"; }
@@ -22,20 +21,20 @@ MEM_THRESHOLD=$((16 * 1024))  # 16GB in MB
 SWAP_AVAILABLE=$(free -m | awk '/^Swap:/{print $2}')
 SWAP_THRESHOLD=4096  # 4GB
 if [ "$MEM_AVAILABLE" -lt "$MEM_THRESHOLD" ]; then
-    echo "Error: Insufficient memory. Available: $((MEM_AVAILABLE / 1024))GB, Required: 16GB"
-    exit 1
+    echo "Warn: Insufficient memory. Available: $((MEM_AVAILABLE / 1024))GB, Suggested: 16GB"
+    # exit 1
 fi
 if [ "$SWAP_AVAILABLE" -lt "$SWAP_THRESHOLD" ]; then
-    echo "Error: Insufficient swap space. Available: ${SWAP_AVAILABLE}MB, Required: ${SWAP_THRESHOLD}MB"
-    exit 1
+    echo "Warn: Insufficient swap space. Available: ${SWAP_AVAILABLE}MB, Suggested: ${SWAP_THRESHOLD}MB"
+    # exit 1
 fi
 
 # Check disk space
 DISK_AVAILABLE=$(df -m /tmp | awk 'NR==2 {print $4}')
 DISK_THRESHOLD=10240  # 10GB
 if [ "$DISK_AVAILABLE" -lt "$DISK_THRESHOLD" ]; then
-    echo "Error: Insufficient disk space in /tmp. Available: ${DISK_AVAILABLE}MB, Required: ${DISK_THRESHOLD}MB"
-    exit 1
+    echo "Error: Insufficient disk space in /tmp. Available: ${DISK_AVAILABLE}MB, Suggested: ${DISK_THRESHOLD}MB"
+    # exit 1
 fi
 
 send_alert() {
@@ -97,6 +96,8 @@ CUSTOM_IMAGE=${CUSTOM_IMAGE:-my-erpnext-v15-custom}
 CUSTOM_TAG=${CUSTOM_TAG:-latest}
 SITE_NAME=${SITES:-nexterp}
 COMPOSE_FILES_DEFAULT="-f compose.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
+GITHUB_TOKEN="${GITHUB_TOKEN}"
+info  "find github token..."
 
 # If overrides/compose.custom.yaml exists, include it
 get_compose_files() {
@@ -119,7 +120,7 @@ trap cleanup_tmp EXIT
 is_build_complete() {
     local required_apps=(telephony hrms helpdesk print_designer insights drive)
     # image must exist
-    if ! docker image inspect "${CUSTOM_IMAGE}:${CUSTOM_TAG}" >/dev/null 2>&1; then
+    if ! docker image inspect "${CUSTOM_IMAGE}" >/dev/null 2>&1; then
         return 1
     fi
     for app in "${required_apps[@]}"; do
@@ -344,29 +345,120 @@ check_app_versions() {
         return 0
     fi
 }
+# -- get the latest erpnext tag on the docker hub
+get_dockerhub_tag() {
+    local repo="$1"
+    local current_ver="${2:-${BASE_TAG:-v15.83.0}}"
+
+    if [[ -z "$repo" ]]; then
+        error "Usage: $0 get_dockerhub_tag <repo> [current_version]"
+        exit 1
+    fi
+
+    info "Checking for newer Docker Hub tags than ${current_ver} in repo ${repo}..."
+    
+    # 取得 tags
+    local docker_raw
+    docker_raw=$(curl -s "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=100")
+    if [[ -z "$docker_raw" || "$docker_raw" == "null" ]]; then
+        warn "Failed to fetch tags from Docker Hub. Using ${current_ver}"
+        echo "        $current_ver"
+        return
+    fi
+
+    # 過濾版本號
+    local latest_tag
+    latest_tag=$(echo "$docker_raw" \
+        | jq -r '.results[]?.name' \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sed 's/^v//' \
+        | sort -V \
+        | awk -v cv="${current_ver#v}" '$0 > cv {print $0}' \
+        | tail -n1)
+
+    if [[ -n "$latest_tag" ]]; then
+        latest_tag="v$latest_tag"
+        erpnext_ver="v$latest_tag"		
+        info "Found newer Docker Hub tag: $latest_tag (was $current_ver)"
+        echo "        $latest_tag"
+    else
+        info "No newer Docker Hub tag found, using $current_ver"
+        erpnext_ver="$current_ver"
+    fi
+	export erpnext_ver
+}
 
 # ---------- Generate Dockerfile.custom ----------
 generate_custom_dockerfile() {
     info "Generating Dockerfile.custom..."
     local erpnext_ver="${ERPNEXT_VERSION:-${BASE_TAG}}"
     local github_erpnext_ver="${GITHUB_ERPNEXT_VERSION:-${erpnext_ver}}"
+    local docker_base="frappe/erpnext"
+    local use_mirror=false
 
-    # 获取 Docker Hub 最新大版本
-    local docker_raw latest_tag
-    docker_raw=$(curl -s "https://registry.hub.docker.com/v2/repositories/frappe/erpnext/tags?page_size=100")
-    latest_tag=$(echo "$docker_raw" | jq -r '.results[]?.name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
-    erpnext_ver="${latest_tag:-${BASE_TAG}}"
-    echo "Docker Hub ERPNext latest version: $latest_tag"
+    # -------------------------------
+    # 函數：檢查 Docker Hub 標籤是否存在（快速 API 檢測）
+    # -------------------------------
+    check_dockerhub_tag() {
+        local repo="$1"
+        local tag="$2"
+        local url="https://hub.docker.com/v2/repositories/${repo}/tags/${tag}"
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+        if [[ "$http_code" == "200" ]]; then
+            return 0   # tag 存在
+        else
+            return 1   # tag 不存在或不可達
+        fi
+    }
 
-    # 版本比较
-    local erpnext_ver_num=$(echo "$erpnext_ver" | sed 's/^v//')
-    local github_ver_num=$(echo "$github_erpnext_ver" | sed 's/^v//')
-    local use_github=false
-    if [ "$(printf '%s\n' "$github_ver_num" "$erpnext_ver_num" | sort -V | tail -n1)" = "$github_ver_num" ] && [ "$github_ver_num" != "$erpnext_ver_num" ]; then
-        use_github=true
+    info "Checking Docker Hub for image frappe/erpnext:${BASE_TAG}..."
+    if check_dockerhub_tag "frappe/erpnext" "${BASE_TAG}"; then
+        info "✅ Docker Hub image frappe/erpnext:${BASE_TAG} exists"
+		#erpnext_ver=$(get_dockerhub_tag "frappe/erpnext" "$BASE_TAG")
+    else
+        warn "⚠️ Docker Hub image not found, will try China mainland mirrors..."
+        use_mirror=true
     fi
 
-    # 检查 wheels
+    # -------------------------------
+    # 嘗試中國鏡像源 https://status.anye.xyz/
+    # -------------------------------
+    if [[ "$use_mirror" == true ]]; then
+        local mirrors=(
+            "docker.1ms.run"
+            "mirror.ccs.tencentyun.com"
+            "docker.m.ixdev.cn"
+        )
+        local mirror_found=""
+        for mirror in "${mirrors[@]}"; do
+            info "Testing mirror tag existence: ${mirror}/frappe/erpnext:${BASE_TAG}"
+            # 使用 Docker Hub API 兼容鏡像方式檢查 (如有 API 可用)
+            # 這裡簡化：假設鏡像存在，如果不可達會 fallback 到 BASE_TAG
+            if curl -s --max-time 3 "https://${mirror}/v2/frappe/erpnext/manifests/${BASE_TAG}" -o /dev/null; then
+                docker_base="${mirror}/frappe/erpnext"
+                mirror_found="$mirror"
+                info "✅ Found usable mirror: ${docker_base}:${BASE_TAG}"
+                break
+            else
+                warn "Mirror ${mirror} unreachable or tag not found."
+            fi
+        done
+
+        if [[ -z "$mirror_found" ]]; then
+            warn "❌ All mirrors failed. Will use BASE_TAG=${BASE_TAG} (build may fail)."
+        fi
+    fi
+
+    # -------------------------------
+    # 設置最終 FROM 行
+    # -------------------------------
+    local from_line="FROM ${docker_base}:${erpnext_ver}"
+    info "Final base image: ${from_line}"
+
+    # -------------------------------
+    # 檢查 wheels
+    # -------------------------------
     local wheels_copy=""
     if [ -d "$PROJECT_DIR/wheels" ]; then
         local wheel_files=("$PROJECT_DIR/wheels"/*.whl)
@@ -377,8 +469,16 @@ RUN pip install --no-cache-dir /wheels/*.whl"
         fi
     fi
 
-    # 设置基础镜像
-    local from_line="FROM frappe/erpnext:${erpnext_ver}"
+    # -------------------------------
+    # 判斷是否用 GitHub 源
+    # -------------------------------
+    local erpnext_ver_num=$(echo "$erpnext_ver" | sed 's/^v//')
+    local github_ver_num=$(echo "$github_erpnext_ver" | sed 's/^v//')
+    local use_github=false
+    if [ "$(printf '%s\n' "$github_ver_num" "$erpnext_ver_num" | sort -V | tail -n1)" = "$github_ver_num" ] && [ "$github_ver_num" != "$erpnext_ver_num" ]; then
+        use_github=true
+    fi
+
     local extra_clone=""
     if [ "$use_github" = true ]; then
         auto_detect_app_versions
@@ -390,10 +490,12 @@ RUN pip install --no-cache-dir /wheels/*.whl"
 RUN npm install --prefix apps/erpnext onscan.js
 RUN npm install -g npm@latest && npm install esbuild@latest && npx update-browserslist-db@latest"
     else
-        info "Using Docker Hub image for ERPNext: ${erpnext_ver}"
+        info "Using base image: ${docker_base}:${erpnext_ver}"
     fi
 
-    # 生成 Dockerfile
+    # -------------------------------
+    # 生成 Dockerfile.custom
+    # -------------------------------
     cat > Dockerfile.custom <<EOF
 ARG ERPNEXT_VERSION=${erpnext_ver}
 $from_line
@@ -452,7 +554,10 @@ RUN bench build --app frappe --verbose || { cat /home/frappe/frappe-bench/logs/*
     && bench build --app lms --verbose || { cat /home/frappe/frappe-bench/logs/*; exit 1; } \
     && bench build --app builder
 EOF
+
+    info "✅ Dockerfile.custom generated successfully!"
 }
+
 
 # ---------- Build custom image ----------
 build_custom_image() {
@@ -538,6 +643,47 @@ check_mysql_user() {
     if [ -z "$SITE_JSON" ]; then
         warn "site_config.json not found or empty in backend container for site ${site_name}"
         return 1
+    fi
+
+    # 检查并设置 host_name
+    if [ -z "$HOSTNAME" ]; then
+        warn "SITE_HOSTNAME is not set in .env, and no default hostname provided. Skipping host_name update."
+    else
+        if ! echo "$SITE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('host_name',''))" 2>/dev/null | grep -q .; then
+            info "host_name not found in site_config.json, adding '${HOSTNAME}'..."
+
+            docker compose ${compose_files} --env-file .env exec -T backend python3 - <<PYCODE
+import json, pathlib
+path = pathlib.Path("sites/${site_name}/site_config.json")
+try:
+    data = json.loads(path.read_text())
+    data['host_name'] = '${HOSTNAME}'
+    path.write_text(json.dumps(data, indent=1))
+    print("Added host_name '${HOSTNAME}' to site_config.json successfully.")
+except Exception as e:
+    print("⚠️ Failed to add host_name to site_config.json:", e)
+PYCODE
+        else
+            local CURRENT_HOSTNAME
+            CURRENT_HOSTNAME=$(echo "$SITE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('host_name',''))" 2>/dev/null || true)
+            if [ "$CURRENT_HOSTNAME" != "$HOSTNAME" ]; then
+                info "host_name exists but is incorrect ('${CURRENT_HOSTNAME}'), updating to '${HOSTNAME}'..."
+
+                docker compose ${compose_files} --env-file .env exec -T backend python3 - <<PYCODE
+import json, pathlib
+path = pathlib.Path("sites/${site_name}/site_config.json")
+try:
+    data = json.loads(path.read_text())
+    data['host_name'] = '${HOSTNAME}'
+    path.write_text(json.dumps(data, indent=1))
+    print("Updated host_name to '${HOSTNAME}' in site_config.json successfully.")
+except Exception as e:
+    print("⚠️ Failed to update host_name in site_config.json:", e)
+PYCODE
+            else
+                info "host_name '${CURRENT_HOSTNAME}' is already correct in site_config.json."
+            fi
+        fi
     fi
 	
     # 检查是否存在 SaaS 限制字段 user_type_doctype_limit，并清理
@@ -684,19 +830,47 @@ verify_site_health() {
         return 1
     fi
 }
-# ---------- Deploy stack ----------
 
+# -------------------------------
+# 用於檢查多個端口
+# -------------------------------
+check_port() {
+    local port=$1
+    if ss -tln | awk '{print $4}' | grep -q ":$port$"; then
+        warn "⚠️ Port $port is already in use"
+        return 1
+    else
+        info "✅ Port $port is free"
+        return 0
+    fi
+}
+
+check_required_ports() {
+    local ports=("$@")
+    local conflict=false
+    for p in "${ports[@]}"; do
+        if ! check_port "$p"; then
+            conflict=true
+        fi
+    done
+
+    if [[ "$conflict" == true ]]; then
+        error "One or more required host ports are in use. Please free them before deploying."
+        exit 1
+    fi
+}
+
+# ---------- Deploy stack ----------
 deploy_stack() {
     local deploy_log="${PROJECT_DIR}/deploy.log"
     echo "[$(date)] Starting deployment for site '${SITE_NAME}'" >> "$deploy_log"
-
+    check_required_ports ${HTTP_PUBLISH_PORT:-8080}
     check_required_files
-
     local compose_files
     compose_files=$(get_compose_files)
 
     info "Bringing up DB and Redis first..."
-    docker compose ${compose_files} --env-file .env up -d db redis-cache redis-queue >> "$deploy_log" 2>&1
+    docker compose ${compose_files} --env-file .env up -d db redis-cache redis-queue #>> "$deploy_log" 2>&1
     sleep 5
 
     if ! wait_for_mariadb_root; then
@@ -710,7 +884,7 @@ deploy_stack() {
     fi
 
     info "Bringing up remaining services..."
-    docker compose ${compose_files} --env-file .env up -d --remove-orphans >> "$deploy_log" 2>&1
+    docker compose ${compose_files} --env-file .env up -d --remove-orphans #>> "$deploy_log" 2>&1
     info "All services started (docker compose up -d). Waiting for backend to be ready..."
 
     local tries=0
@@ -729,10 +903,7 @@ deploy_stack() {
     done
 
     # Pre-backup if site exists
-    if docker compose ${compose_files} --env-file .env exec -T backend test -f "sites/${SITE_NAME}/site_config.json" >/dev/null 2>&1; then
-        info "Backing up existing site '${SITE_NAME}'..."
-        docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" backup >> "$deploy_log" 2>&1 || warn "Backup failed - proceed with caution"
-    fi
+    cmd_backup
 
     info "Checking if site '${SITE_NAME}' exists..."
     if ! docker compose ${compose_files} --env-file .env exec -T backend test -f "sites/${SITE_NAME}/site_config.json" >/dev/null 2>&1 || \
@@ -983,32 +1154,7 @@ cmd_redeploy() {
 
     # Backup before drop
     info "Backing up site '${SITE_NAME}' before drop..."
-    if docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" backup >> "$deploy_log" 2>&1; then
-        info "Backup created in container: sites/${SITE_NAME}/private/backups/$(date +%Y%m%d_%H%M%S)-${SITE_NAME}.tar.xz"
-        # Create host backups directory if it doesn't exist
-        mkdir -p "${PROJECT_DIR}/backups"
-        # Copy backup files to host ./backups
-        local backup_dir="sites/${SITE_NAME}/private/backups"
-        local latest_timestamp
-        latest_timestamp=$(docker compose ${compose_files} --env-file .env exec -T backend ls -t "${backup_dir}" | grep -E "^[0-9]{8}_[0-9]{6}-${SITE_NAME}" | head -n 1 | cut -d'-' -f1)
-        if [ -n "$latest_timestamp" ]; then
-            docker compose ${compose_files} --env-file .env cp backend:/home/frappe/frappe-bench/${backup_dir}/${latest_timestamp}-${SITE_NAME}-database.sql.gz "${PROJECT_DIR}/backups/" || true
-            docker compose ${compose_files} --env-file .env cp backend:/home/frappe/frappe-bench/${backup_dir}/${latest_timestamp}-${SITE_NAME}-site_config_backup.json "${PROJECT_DIR}/backups/" || true
-            info "Backup files copied to host: ${PROJECT_DIR}/backups/ (${latest_timestamp}-${SITE_NAME}-*)"
-            # 清除容器内的备份文件
-            if docker compose ${compose_files} --env-file .env exec -T backend rm -rf "${backup_dir}/*" >> "$deploy_log" 2>&1; then
-                info "Container backup files cleared successfully: ${backup_dir}/*"
-            else
-                warn "Failed to clear container backup files - check $deploy_log for details."
-            fi			
-        else
-            warn "No backup files found in container - check $deploy_log"
-            echo "[$(date)] No backup files found for site '${SITE_NAME}'" >> "$deploy_log"
-        fi
-    else
-        warn "Backup failed - proceeding with caution."
-        echo "[$(date)] Backup failed for site '${SITE_NAME}'" >> "$deploy_log"
-    fi
+    cmd_backup
 	
     #停止并清理容器卷
 	local compose_files
@@ -1032,107 +1178,163 @@ cmd_redeploy() {
     cmd_deploy
 }
 
-cmd_restore_backup() {
-    local compose_files
-    compose_files=$(get_compose_files)
-    local deploy_log="${PROJECT_DIR}/deploy.log"
-
-    # Create backups directory if it doesn't exist
-    mkdir -p "${PROJECT_DIR}/backups"
-
-    # List available backups (.tar.xz files) in ./backups
-    info "Listing available backups in ${PROJECT_DIR}/backups..."
-    local backups
-    backups=$(ls -t "${PROJECT_DIR}/backups" | grep "\.tar\.xz$" || true)
-    if [ -z "$backups" ]; then
-        error "No .tar.xz backup files found in ${PROJECT_DIR}/backups"
-        exit 1
-    fi
-
-    # Display backups with index
-    info "Available backups:"
-    local index=1
-    local backup_array=()
-    while IFS= read -r backup; do
-        echo "[$index] $backup"
-        backup_array+=("$backup")
-        ((index++))
-    done <<< "$backups"
-
-    # Prompt user to select a backup
-    read -p "Enter the number of the backup to restore (1-${#backup_array[@]}): " -r selection
-    if [[ ! $selection =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#backup_array[@]}" ]; then
-        error "Invalid selection. Please choose a number between 1 and ${#backup_array[@]}"
-        exit 1
-    fi
-
-    local selected_backup=${backup_array[$((selection-1))]}
-    info "Restoring backup '${selected_backup}' to site '${SITE_NAME}'..."
-
-    # Copy selected backup to container
-    docker compose ${compose_files} --env-file .env cp "${PROJECT_DIR}/backups/${selected_backup}" backend:/home/frappe/frappe-bench/sites/${SITE_NAME}/private/backups/${selected_backup} || {
-        error "Failed to copy backup to container - check $deploy_log"
-        exit 1
-    }
-
-    # Restore the backup
-    if docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" restore "sites/${SITE_NAME}/private/backups/${selected_backup}" >> "$deploy_log" 2>&1; then
-        info "Backup '${selected_backup}' restored successfully."
-    else
-        error "Restore failed - check $deploy_log for details."
-        exit 1
-    fi
-
-    # Verify site health after restore
-    info "Running health verification..."
-    if ! verify_site_health "${SITE_NAME}" --strict --log-file "$deploy_log"; then
-        error "Health verification failed after restore - check $deploy_log for details."
-        exit 1
-    fi
-
-    info "Restore completed - site '${SITE_NAME}' is ready ✅"
-    echo "[$(date)] Restore successful for site '${SITE_NAME}' using backup '${selected_backup}'" >> "$deploy_log"
-}
+# ---- Backup site (v15 stable) ----
 cmd_backup() {
     local compose_files
     compose_files=$(get_compose_files)
     local deploy_log="${PROJECT_DIR}/deploy.log"
     local site_name="${SITE_NAME}"
-
-    # Check container disk space
-    local container_disk
-    container_disk=$(docker compose ${compose_files} --env-file .env exec -T backend df -m /home/frappe/frappe-bench/sites | awk 'NR==2 {print $4}' 2>/dev/null || echo "unknown")
-    if [ "$container_disk" != "unknown" ] && [ "$container_disk" -lt 1024 ]; then
-        warn "Low disk space in backend container: ${container_disk}MB available. Clearing container backups..."
-        docker compose ${compose_files} --env-file .env exec -T backend rm -rf "sites/${site_name}/private/backups/*" >> "$deploy_log" 2>&1 || warn "Failed to clear container backups"
-    fi
+    local safe_site_name="${site_name//./_}"  # 点号换下划线
+    local backup_dir="sites/${site_name}/private/backups"
 
     info "Backing up site '${site_name}'..."
-    if docker compose ${compose_files} --env-file .env exec -T backend bench --site "${site_name}" backup >> "$deploy_log" 2>&1; then
-        info "Backup created in container: sites/${site_name}/private/backups/$(date +%Y%m%d_%H%M%S)-${site_name}.tar.xz"
-        mkdir -p "${PROJECT_DIR}/backups"
-        local backup_dir="sites/${site_name}/private/backups"
-        local latest_timestamp
-        latest_timestamp=$(docker compose ${compose_files} --env-file .env exec -T backend ls -t "${backup_dir}" | grep -E "^[0-9]{8}_[0-9]{6}-${site_name}" | head -n 1 | cut -d'-' -f1)
-        if [ -n "$latest_timestamp" ]; then
-            docker compose ${compose_files} --env-file .env cp backend:/home/frappe/frappe-bench/${backup_dir}/${latest_timestamp}-${site_name}-database.sql.gz "${PROJECT_DIR}/backups/" || warn "Failed to copy database backup to host"
-            docker compose ${compose_files} --env-file .env cp backend:/home/frappe/frappe-bench/${backup_dir}/${latest_timestamp}-${site_name}-site_config_backup.json "${PROJECT_DIR}/backups/" || warn "Failed to copy site config backup to host"
-            info "Backup files copied to host: ${PROJECT_DIR}/backups/ (${latest_timestamp}-${site_name}-*)"
-            if docker compose ${compose_files} --env-file .env exec -T backend rm -rf "${backup_dir}/*" >> "$deploy_log" 2>&1; then
-                info "Container backup files cleared successfully: ${backup_dir}/*"
-            else
-                warn "Failed to clear container backup files - check $deploy_log for details."
-            fi
+    if docker compose ${compose_files} --env-file .env exec -T backend \
+        bench --site "${site_name}" backup >> "$deploy_log" 2>&1; then
+
+        info "Backup finished inside container. Listing generated files:"
+        docker compose ${compose_files} --env-file .env exec -T backend ls -lh "${backup_dir}" | tail -n +2
+
+        # 找出最新的数据库文件前缀
+        local latest_prefix
+        latest_prefix=$(docker compose ${compose_files} --env-file .env exec -T backend \
+            ls -t "${backup_dir}" | grep "${safe_site_name}-database.sql.gz" | head -n 1 | sed 's/-database\.sql\.gz$//')
+
+        if [ -n "$latest_prefix" ]; then
+            mkdir -p "${PROJECT_DIR}/backups"
+            local backup_files=(
+                "${latest_prefix}-database.sql.gz"
+                "${latest_prefix}-site_config_backup.json"
+                "${latest_prefix}-files.tar"
+                "${latest_prefix}-private-files.tar"
+            )
+
+            for f in "${backup_files[@]}"; do
+                if docker compose ${compose_files} --env-file .env exec -T backend test -f "${backup_dir}/${f}" 2>/dev/null; then
+                    docker compose ${compose_files} --env-file .env cp \
+                        "backend:/home/frappe/frappe-bench/${backup_dir}/${f}" "${PROJECT_DIR}/backups/" || true
+                else
+                    info "Skipping missing file: ${f}"
+                fi
+            done
+
+            info "Backup files copied to host: ${PROJECT_DIR}/backups/"
+			local container_backup_dir="/home/frappe/frappe-bench/sites/${site_name}/private/backups"
+            docker compose ${compose_files} --env-file .env exec -T backend sh -c \
+            "rm -rf ${container_backup_dir}/* && ls -lh ${container_backup_dir}" >> "$deploy_log" 2>&1 \
+            && info "Container backup files cleared successfully." \
+            || warn "Failed to clear container backup files."
+
         else
             warn "No backup files found in container - check $deploy_log"
-            echo "[$(date)] No backup files found for site '${site_name}'" >> "$deploy_log"
         fi
     else
-        error "Backup failed - check $deploy_log for details."
-        send_alert "Backup failed for ${site_name}. Check $deploy_log"
-        exit 1
+        warn "Backup failed for ${site_name}"
     fi
 }
+
+# ---- Restore site (v15 stable, TCP DB) ----
+cmd_restore_backup() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    local site_name="${SITE_NAME}"
+    local safe_site_name="${site_name//./_}"
+    local backup_dir="sites/${site_name}/private/backups"
+
+    mkdir -p "${PROJECT_DIR}/backups"
+
+    # 列出可用数据库备份前缀
+    info "Listing available backups in ${PROJECT_DIR}/backups..."
+    local backup_prefixes
+    backup_prefixes=$(ls -1 "${PROJECT_DIR}/backups" | grep "${safe_site_name}-database.sql.gz" | sed -E "s/-database\.sql\.gz//" | sort -r)
+
+    if [ -z "$backup_prefixes" ]; then
+        error "No backups found in ${PROJECT_DIR}/backups for site '${site_name}'"
+        exit 1
+    fi
+
+    # 显示备份供用户选择
+    info "Available backups:"
+    local backup_array=()
+    local index=1
+    while IFS= read -r prefix; do
+        echo "[$index] $prefix"
+        backup_array+=("$prefix")
+        ((index++))
+    done <<< "$backup_prefixes"
+
+    read -p "Enter the number of the backup to restore (1-${#backup_array[@]}): " -r selection
+    if [[ ! $selection =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#backup_array[@]}" ]; then
+        error "Invalid selection"
+        exit 1
+    fi
+
+    local selected_prefix=${backup_array[$((selection-1))]}
+    info "Selected backup: ${selected_prefix}"
+
+    # 拷贝 site_config_backup.json 到容器
+    local local_config="${PROJECT_DIR}/backups/${selected_prefix}-site_config_backup.json"
+    if [ ! -f "$local_config" ]; then
+        error "Missing site_config_backup.json for selected backup"
+        exit 1
+    fi
+    docker compose ${compose_files} --env-file .env cp "$local_config" \
+        "backend:/home/frappe/frappe-bench/${backup_dir}/${selected_prefix}-site_config_backup.json"
+
+    # 从 site_config_backup.json 读取数据库信息
+    local db_name db_password db_type db_host
+    read -r db_name db_password db_type <<< $(docker compose ${compose_files} --env-file .env exec -T backend \
+        bash -c "jq -r '[.db_name, .db_password, .db_type] | @tsv' ${backup_dir}/${selected_prefix}-site_config_backup.json")
+
+    # 判断 DB host
+    db_host="db"  # 默认 docker-compose service 名，如果 site_config 有 host_name 可解析
+    if docker compose ${compose_files} --env-file .env exec -T backend \
+        bash -c "jq -e '.host_name' ${backup_dir}/${selected_prefix}-site_config_backup.json" >/dev/null 2>&1; then
+        db_host="db"  # 可以在这里解析 URL，通常还是 db
+    fi
+
+    # 校验数据库备份完整性
+    local db_file="${PROJECT_DIR}/backups/${selected_prefix}-database.sql.gz"
+    if ! gzip -t "$db_file" >/dev/null 2>&1; then
+        error "Database backup file '${db_file}' is corrupted!"
+        exit 1
+    fi
+
+    # 拷贝数据库备份到容器
+    docker compose ${compose_files} --env-file .env cp "$db_file" \
+        "backend:/home/frappe/frappe-bench/${backup_dir}/${selected_prefix}-database.sql.gz"
+
+    # 恢复数据库（TCP 连接）
+    info "Restoring database via TCP..."
+    docker compose ${compose_files} --env-file .env exec -T backend bash -c \
+        "gunzip < '${backup_dir}/${selected_prefix}-database.sql.gz' | mysql -h ${db_host} -P 3306 -u '${db_name}' -p'${db_password}' '${db_name}'" >> "$deploy_log" 2>&1 \
+        && info "Database restored successfully." || { error "Database restore failed - check $deploy_log"; exit 1; }
+
+    # 恢复文件和私有文件
+    for tar_file in files.tar private-files.tar; do
+        local local_file="${PROJECT_DIR}/backups/${selected_prefix}-${tar_file}"
+        if [ -f "$local_file" ]; then
+            local target_dir="/home/frappe/frappe-bench/sites/${site_name}/"
+            [ "$tar_file" == "files.tar" ] && target_dir+="/public/files" || target_dir+="/private/files"
+            info "Restoring ${tar_file} to ${target_dir}..."
+            docker compose ${compose_files} --env-file .env exec -T backend bash -c \
+                "mkdir -p '${target_dir}' && tar -xf '${backup_dir}/${selected_prefix}-${tar_file}' -C '${target_dir}'" >> "$deploy_log" 2>&1 \
+                && info "${tar_file} restored." || warn "Failed to restore ${tar_file}"
+        fi
+    done
+
+    # 健康检查
+    info "Running health verification..."
+    if ! verify_site_health "${site_name}" --strict --log-file "$deploy_log"; then
+        error "Health verification failed after restore"
+        exit 1
+    fi
+
+    info "Restore completed - site '${site_name}' is ready ✅"
+    echo "[$(date)] Restore successful for site '${site_name}' using backup '${selected_prefix}'" >> "$deploy_log"
+}
+
+
 cmd_fix_routing() {
     local compose_files
     compose_files=$(get_compose_files)
@@ -1167,7 +1369,7 @@ cmd_quick_rebuild() {
     check_required_files
 
     local use_cache=true
-    if docker image inspect "${CUSTOM_IMAGE}:${CUSTOM_TAG}" >/dev/null 2>&1; then
+    if docker image inspect "${CUSTOM_IMAGE}" >/dev/null 2>&1; then
         if ! is_build_complete; then
             use_cache=false
             warn "Previous build incomplete (missing apps), forcing full rebuild"
@@ -1325,14 +1527,20 @@ case "${1:-}" in
     check_mysql_user)  cmd_check_mysql_user ;;
     quick-rebuild)     cmd_quick_rebuild "${@}" ;;
     health-check)      cmd_health_check "${@}" ;;
+	backup)            cmd_backup ;;
     restore-backup)    cmd_restore_backup "${@}" ;;
     verify_site_health) verify_site_health "$@" ;;
     upgrade)           cmd_upgrade ;;
 	get_latest_version) auto_detect_app_versions "$@" ;;
+    get_dockerhub_tag)
+    shift
+    get_dockerhub_tag "$@"
+    ;;
+
     *) 
         cat <<USAGE
 Usage: $0 {deploy|build-custom-image|start|stop|restart|
-    restore-backup|logs|status|cleanup|force-cleanup|
+    restore-backup|logs|status|cleanup|force-cleanup|get_dockerhub_tag|
     rebuild-and-deploy|redeploy|fix-routing|fix-configurator|
     check_mysql_user|quick-rebuild|health-check|upgrade|get_latest_version}
 

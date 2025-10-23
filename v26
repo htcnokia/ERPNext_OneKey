@@ -1,0 +1,2069 @@
+#!/bin/bash
+
+set -euo pipefail
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${PROJECT_DIR}/.env"
+
+deploy_log="${PROJECT_DIR}/deploy.log"
+: "${deploy_log:=${PROJECT_DIR}/deploy.log}"
+
+# ---------- Logging ----------
+info()  { echo -e "\033[1;32m[INFO]\033[0m  $*"; }
+warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
+error() { echo -e "\033[1;31m[ERROR]\033[0m $*"; }
+
+# clean .log
+find "${PROJECT_DIR}" -maxdepth 1 -type f -name "*.log" -exec rm -f {} \;
+
+# Check available memory and swap
+MEM_AVAILABLE=$(free -m | awk '/^Mem:/{print $2}')
+MEM_THRESHOLD=$((16 * 1024))  # 16GB in MB
+SWAP_AVAILABLE=$(free -m | awk '/^Swap:/{print $2}')
+SWAP_THRESHOLD=4096  # 4GB
+# if [ "$MEM_AVAILABLE" -lt "$MEM_THRESHOLD" ]; then
+    # echo "Warn: Insufficient memory. Available: $((MEM_AVAILABLE / 1024))GB, Suggested: 16GB"
+    # # exit 1
+# fi
+# if [ "$SWAP_AVAILABLE" -lt "$SWAP_THRESHOLD" ]; then
+    # echo "Warn: Insufficient swap space. Available: ${SWAP_AVAILABLE}MB, Suggested: ${SWAP_THRESHOLD}MB"
+    # # exit 1
+# fi
+
+# Check disk space
+DISK_AVAILABLE=$(df -m /tmp | awk 'NR==2 {print $4}')
+DISK_THRESHOLD=10240  # 10GB
+if [ "$DISK_AVAILABLE" -lt "$DISK_THRESHOLD" ]; then
+    echo "Error: Insufficient disk space in /tmp. Available: ${DISK_AVAILABLE}MB, Suggested: ${DISK_THRESHOLD}MB"
+    # exit 1
+fi
+
+send_alert() {
+    local message="$1"
+    local corpid="${WECHAT_CORPID:-123456}"
+    local agentid="${WECHAT_AGENTID:-128}"
+    local secret="${WECHAT_SECRET:-5256332225556222fzQ}"
+    local touser="${WECHAT_TOUSER:-user1}"  # Default to 'user1', override in .env
+
+    # Get access token
+    local token_url="https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${corpid}&corpsecret=${secret}"
+    local token_response
+    token_response=$(curl -s "$token_url")
+    local access_token
+    access_token=$(echo "$token_response" | jq -r '.access_token // empty')
+    if [ -z "$access_token" ]; then
+        warn "Failed to get WeChat access token: $(echo "$token_response" | jq -r '.errmsg // "Unknown error"')"
+        return 1
+    fi
+
+    # Send message
+    local send_url="https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${access_token}"
+    local payload
+    payload=$(jq -n --arg touser "$touser" --arg agentid "$agentid" --arg msg "$message" \
+        '{touser: $touser, msgtype: "text", agentid: ($agentid | tonumber), text: {content: $msg}, safe: 0}')
+    local send_response
+    send_response=$(curl -s -X POST -H "Content-Type: application/json" -d "$payload" "$send_url")
+    local errcode
+    errcode=$(echo "$send_response" | jq -r '.errcode // -1')
+    if [ "$errcode" -ne 0 ]; then
+        warn "Failed to send WeChat message: $(echo "$send_response" | jq -r '.errmsg // "Unknown error"')"
+        return 1
+    fi
+
+    info "WeChat message sent to ${touser}"
+}
+
+# ---------- Utility: load .env safely ----------
+load_env_file() {
+    local env_file="$1"
+    if [ ! -f "$env_file" ]; then
+        error ".env file not found: ${env_file}"
+        exit 1
+    fi
+    set -o allexport
+    # Only accept simple KEY=VALUE lines; strip CRs
+    # Use awk to avoid exporting comments or malformed lines
+    eval "$(awk '/^[A-Za-z_][A-Za-z0-9_]*=/{gsub(/\r$/,"",$0); print "export "$0}' "$env_file")"
+    set +o allexport
+    info "Environment variables loaded from ${env_file}"
+}
+
+# Load .env immediately so exported vars are available to functions
+load_env_file "$ENV_FILE"
+
+# defaults (if .env lacks them) - unified to latest stable
+BASE_TAG="${ERPNEXT_VERSION}"
+CUSTOM_IMAGE=${CUSTOM_IMAGE:-my-erpnext-v15-custom}
+CUSTOM_TAG=${CUSTOM_TAG:-latest}
+SITE_NAME=${SITES:-nexterp}
+COMPOSE_FILES_DEFAULT="-f compose.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
+GITHUB_TOKEN="${GITHUB_TOKEN}"
+info  "find github token..."
+
+# If overrides/compose.custom.yaml exists, include it
+get_compose_files() {
+    if [ -f "overrides/compose.custom.yaml" ]; then
+        echo "-f compose.yaml -f overrides/compose.custom.yaml -f overrides/compose.mariadb.yaml -f overrides/compose.noproxy.yaml -f overrides/compose.redis.yaml"
+    else
+        echo "${COMPOSE_FILES_DEFAULT}"
+    fi
+}
+
+# ---------- Cleanup helpers ----------
+cleanup_tmp() {
+    [ -f Dockerfile.custom ] && rm -f Dockerfile.custom
+    [ -f overrides/compose.custom.yaml ] && rm -f overrides/compose.custom.yaml
+}
+trap cleanup_tmp EXIT
+
+# ---------- Check if build is complete ----------
+# Check that built image contains required app directories
+is_build_complete() {
+    local required_apps=(telephony hrms helpdesk print_designer insights drive)
+    # image must exist
+    if ! docker image inspect "${CUSTOM_IMAGE}" >/dev/null 2>&1; then
+        return 1
+    fi
+    for app in "${required_apps[@]}"; do
+        if ! docker run --rm "${CUSTOM_IMAGE}:${CUSTOM_TAG}" test -d "/home/frappe/frappe-bench/apps/${app}" 2>/dev/null; then
+            warn "Missing app directory in image: ${app}"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# ---------- Auto detect latest compatible app versions from GitHub ----------
+auto_detect_app_versions() {
+    local GITHUB_TOKEN_VALUE="${GITHUB_TOKEN:-}"
+    local token_header=()
+    local using_token=false
+    local UA_HEADER=(-H "User-Agent: frappe-deploy-script")
+
+    if [ -n "${GITHUB_TOKEN_VALUE:-}" ]; then
+        token_header=(-H "Authorization: token ${GITHUB_TOKEN_VALUE}")
+        using_token=true
+        info "Using GitHub token for API requests (pre-checking token health)..."
+        local rl_code
+        rl_code=$(curl -s -o /dev/null -w "%{http_code}" "${token_header[@]}" "${UA_HEADER[@]}" "https://api.github.com/rate_limit" || true)
+        if [ "$rl_code" != "200" ]; then
+            warn "GitHub token test failed (HTTP ${rl_code}). Falling back to anonymous mode."
+            using_token=false
+            token_header=()
+        fi
+    else
+        warn "No GITHUB_TOKEN found, using anonymous mode."
+    fi
+
+    github_api_request() {
+        local url="$1"
+        local response
+        if [ "$using_token" = true ]; then
+            response=$(curl -s "${token_header[@]}" "${UA_HEADER[@]}" "$url" || true)
+        else
+            response=$(curl -s "${UA_HEADER[@]}" "$url" || true)
+        fi
+        echo "$response"
+    }
+
+    safe_jq_names() {
+        # 安全 jq 提取 tags 名称列表，即使空或无效也不会退出脚本
+        jq -r 'try (.[].name) // empty' 2>/dev/null || echo ""
+    }
+
+    get_repo_tags() {
+        local repo="$1"
+        local body
+        body=$(github_api_request "https://api.github.com/repos/${repo}/tags?per_page=100")
+        local count
+        count=$(echo "$body" | jq 'length' 2>/dev/null || echo 0)
+        info "Fetched ${count} tags for ${repo}"
+        echo "$body" | safe_jq_names
+    }
+
+    get_repo_branches() {
+        local repo="$1"
+        local body
+        body=$(github_api_request "https://api.github.com/repos/${repo}/branches?per_page=100")
+        local count
+        count=$(echo "$body" | jq 'length' 2>/dev/null || echo 0)
+        info "Fetched ${count} branches for ${repo}"
+        echo "$body" | safe_jq_names
+    }
+
+    get_highest_tag_for_major() {
+        local repo="$1"
+        local major="$2"
+        get_repo_tags "$repo" | grep -E "^v?${major}\." | sort -V | tail -n1 || true
+    }
+
+    get_highest_tag_overall() {
+        local repo="$1"
+        get_repo_tags "$repo" | grep -E '^v?[0-9]' | sort -V | tail -n1 || true
+    }
+
+    get_highest_major() {
+        local repo="$1"
+        get_repo_tags "$repo" | grep -E '^v?[0-9]+' | sed -E 's/^v?([0-9]+).*/\1/' | sort -n | tail -n1 || true
+    }
+
+    # ---------- 检测主版本 ----------
+    local frappe_major erpnext_major major_ver
+    frappe_major="$(get_highest_major "frappe/frappe")"
+    erpnext_major="$(get_highest_major "frappe/erpnext")"
+
+    if [ -z "${frappe_major:-}" ] || [ -z "${erpnext_major:-}" ]; then
+        warn "Failed to detect frappe/erpnext major versions from GitHub — falling back to Docker Hub."
+        local docker_raw docker_latest docker_major
+        docker_raw="$(curl -s "https://registry.hub.docker.com/v2/repositories/frappe/erpnext/tags?page_size=100" || true)"
+        docker_latest="$(echo "$docker_raw" | jq -r '.results[]?.name' 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+        if [ -n "${docker_latest:-}" ]; then
+            docker_major="$(echo "$docker_latest" | sed -E 's/^v([0-9]+)\..*/\1/' || true)"
+            info "Using Docker Hub ERPNext tag ${docker_latest} (major v${docker_major})"
+            frappe_major="${docker_major}"
+            erpnext_major="${docker_major}"
+        else
+            warn "No valid Docker Hub tag found. Defaulting to v15."
+            frappe_major=15
+            erpnext_major=15
+        fi
+    fi
+
+    major_ver=$(( frappe_major > erpnext_major ? frappe_major : erpnext_major ))
+    info "🔍 Detected latest major version: v${major_ver}"
+
+    # ---------- 各 App ----------
+    FRAPPE_BRANCH="$(get_highest_tag_for_major "frappe/frappe" "$major_ver")"
+    ERPNEXT_BRANCH="$(get_highest_tag_for_major "frappe/erpnext" "$major_ver")"
+
+    local hrms_branches target_branch prev_branch
+    hrms_branches="$(get_repo_branches "frappe/hrms")"
+    target_branch="version-${major_ver}"
+    prev_branch="version-$((major_ver - 1))"
+
+    if echo "${hrms_branches:-}" | grep -q "^${target_branch}$"; then
+        HRMS_BRANCH="${target_branch}"
+    elif echo "${hrms_branches:-}" | grep -q "^${prev_branch}$"; then
+        HRMS_BRANCH="${prev_branch}"
+    else
+        HRMS_BRANCH="$(get_highest_tag_overall "frappe/hrms")"
+    fi
+
+    TELEPHONY_BRANCH="develop"
+    HELP_DESK_BRANCH="$(get_highest_tag_overall "frappe/helpdesk")"
+    PRINT_DESIGNER_BRANCH="$(get_highest_tag_overall "frappe/print_designer")"
+    INSIGHTS_BRANCH="$(get_highest_tag_overall "frappe/insights")"
+    DRIVE_BRANCH="$(get_highest_tag_overall "frappe/drive")"
+    # -------- 新增 App 检测 --------
+    # WIKI_BRANCH="$(get_highest_tag_overall "frappe/wiki")"
+    LMS_BRANCH="$(get_highest_tag_overall "frappe/lms")"
+    BUILDER_BRANCH="$(get_highest_tag_overall "frappe/builder")"
+	
+    # fallback 默认值（保证生产稳定）
+    if [ -z "${FRAPPE_BRANCH:-}" ]; then FRAPPE_BRANCH="v${major_ver}.x-latest"; fi
+    if [ -z "${ERPNEXT_BRANCH:-}" ]; then ERPNEXT_BRANCH="v${major_ver}.x-latest"; fi
+    if [ -z "${HRMS_BRANCH:-}" ]; then HRMS_BRANCH="v15.51.0"; fi
+    if [ -z "${HELP_DESK_BRANCH:-}" ]; then HELP_DESK_BRANCH="v1.15.1"; fi
+    if [ -z "${PRINT_DESIGNER_BRANCH:-}" ]; then PRINT_DESIGNER_BRANCH="v1.6.2"; fi
+    if [ -z "${INSIGHTS_BRANCH:-}" ]; then INSIGHTS_BRANCH="v3.2.11"; fi
+    if [ -z "${DRIVE_BRANCH:-}" ]; then DRIVE_BRANCH="v0.3.0"; fi
+    if [ -z "${WIKI_BRANCH:-}" ]; then WIKI_BRANCH="develop"; fi
+    if [ -z "${LMS_BRANCH:-}" ]; then LMS_BRANCH="v2.39.0"; fi
+    if [ -z "${BUILDER_BRANCH:-}" ]; then BUILDER_BRANCH="v1.20.1"; fi
+
+    CUSTOM_IMAGE="my-erpnext-v${major_ver}-custom"
+    # --锁定特殊app ---
+	WIKI_BRANCH="develop"
+	
+    export FRAPPE_BRANCH ERPNEXT_BRANCH HRMS_BRANCH TELEPHONY_BRANCH HELP_DESK_BRANCH \
+           PRINT_DESIGNER_BRANCH INSIGHTS_BRANCH DRIVE_BRANCH CUSTOM_IMAGE \
+           WIKI_BRANCH LMS_BRANCH BUILDER_BRANCH
+
+    info "✅ Auto-selected versions (aligned with v${major_ver}):"
+    echo "  FRAPPE_BRANCH=${FRAPPE_BRANCH}"
+    echo "  ERPNEXT_BRANCH=${ERPNEXT_BRANCH}"
+    echo "  HRMS_BRANCH=${HRMS_BRANCH}"
+    echo "  TELEPHONY_BRANCH=${TELEPHONY_BRANCH}"
+    echo "  HELP_DESK_BRANCH=${HELP_DESK_BRANCH}"
+    echo "  PRINT_DESIGNER_BRANCH=${PRINT_DESIGNER_BRANCH}"
+    echo "  INSIGHTS_BRANCH=${INSIGHTS_BRANCH}"
+    echo "  DRIVE_BRANCH=${DRIVE_BRANCH}"
+    echo "  WIKI_BRANCH=${WIKI_BRANCH}"
+    echo "  LMS_BRANCH=${LMS_BRANCH}"
+    echo "  BUILDER_BRANCH=${BUILDER_BRANCH}"
+    echo "  CUSTOM_IMAGE=${CUSTOM_IMAGE}"
+}
+
+
+# ---------- Check app versions against .env ----------
+check_app_versions() {
+    info "Checking app versions against .env..."
+
+    # Get latest versions from GitHub
+    auto_detect_app_versions
+
+    # Define expected versions from GitHub
+    local github_versions=(
+        "FRAPPE_BRANCH=${FRAPPE_BRANCH}"
+        "ERPNEXT_BRANCH=${ERPNEXT_BRANCH}"
+        "HRMS_BRANCH=${HRMS_BRANCH}"
+        "TELEPHONY_BRANCH=${TELEPHONY_BRANCH}"
+        "HELP_DESK_BRANCH=${HELP_DESK_BRANCH}"
+        "PRINT_DESIGNER_BRANCH=${PRINT_DESIGNER_BRANCH}"
+        "INSIGHTS_BRANCH=${INSIGHTS_BRANCH}"
+        "DRIVE_BRANCH=${DRIVE_BRANCH}"
+        "WIKI_BRANCH=${WIKI_BRANCH}"
+        "LMS_BRANCH=${LMS_BRANCH}"
+        "BUILDER_BRANCH=${BUILDER_BRANCH}"		
+        "CUSTOM_IMAGE=${CUSTOM_IMAGE}"
+    )
+
+    local env_versions=()
+    local needs_update=false
+
+    # Read current .env versions
+    for version in "${github_versions[@]}"; do
+        local key="${version%%=*}"
+        local github_value="${version#*=}"
+        local env_value=$(grep "^${key}=" "$ENV_FILE" | cut -d'=' -f2-)
+
+        if [ -z "$env_value" ]; then
+            info "Version for ${key} not found in .env, update required"
+            needs_update=true
+            break
+        elif [ "$env_value" != "$github_value" ]; then
+            info "Version mismatch for ${key}: .env=${env_value}, GitHub=${github_value}"
+            needs_update=true
+            break
+        fi
+    done
+
+    if [ "$needs_update" = false ]; then
+        info "All app versions match .env, no update required"
+        return 1
+    else
+        info "Version mismatch detected, proceeding with build and deploy"
+        return 0
+    fi
+}
+# -- get the latest erpnext tag on the docker hub
+get_dockerhub_tag() {
+    local repo="$1"
+    local current_ver="${2:-${BASE_TAG:-v15.83.0}}"
+
+    if [[ -z "$repo" ]]; then
+        error "Usage: $0 get_dockerhub_tag <repo> [current_version]"
+        exit 1
+    fi
+
+    info "Checking for newer Docker Hub tags than ${current_ver} in repo ${repo}..."
+    
+    # 取得 tags
+    local docker_raw
+    docker_raw=$(curl -s "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=100")
+    if [[ -z "$docker_raw" || "$docker_raw" == "null" ]]; then
+        warn "Failed to fetch tags from Docker Hub. Using ${current_ver}"
+        echo "        $current_ver"
+        return
+    fi
+
+    # 過濾版本號
+    local latest_tag
+    latest_tag=$(echo "$docker_raw" \
+        | jq -r '.results[]?.name' \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sed 's/^v//' \
+        | sort -V \
+        | awk -v cv="${current_ver#v}" '$0 > cv {print $0}' \
+        | tail -n1)
+
+    if [[ -n "$latest_tag" ]]; then
+        latest_tag="v$latest_tag"
+        erpnext_ver="v$latest_tag"		
+        info "Found newer Docker Hub tag: $latest_tag (was $current_ver)"
+        echo "        $latest_tag"
+    else
+        info "No newer Docker Hub tag found, using $current_ver"
+        erpnext_ver="$current_ver"
+    fi
+	export erpnext_ver
+}
+
+# ---------- Generate Dockerfile.custom ----------
+generate_custom_dockerfile() {
+    info "Generating Dockerfile.custom..."
+    local erpnext_ver="${ERPNEXT_VERSION:-${BASE_TAG}}"
+    local github_erpnext_ver="${GITHUB_ERPNEXT_VERSION:-${erpnext_ver}}"
+    local docker_base="frappe/erpnext"
+    local use_mirror=false
+
+    # -------------------------------
+    # 函數：檢查 Docker Hub 標籤是否存在（快速 API 檢測）
+    # -------------------------------
+    check_dockerhub_tag() {
+        local repo="$1"
+        local tag="$2"
+        local url="https://hub.docker.com/v2/repositories/${repo}/tags/${tag}"
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+        if [[ "$http_code" == "200" ]]; then
+            return 0   # tag 存在
+        else
+            return 1   # tag 不存在或不可達
+        fi
+    }
+
+    info "Checking Docker Hub for image frappe/erpnext:${BASE_TAG}..."
+    if check_dockerhub_tag "frappe/erpnext" "${BASE_TAG}"; then
+        info "✅ Docker Hub image frappe/erpnext:${BASE_TAG} exists"
+		#erpnext_ver=$(get_dockerhub_tag "frappe/erpnext" "$BASE_TAG")
+    else
+        warn "⚠️ Docker Hub image not found, will try China mainland mirrors..."
+        use_mirror=true
+    fi
+
+    # -------------------------------
+    # 嘗試中國鏡像源 https://status.anye.xyz/
+    # -------------------------------
+    if [[ "$use_mirror" == true ]]; then
+        local mirrors=(
+            "docker.1ms.run"
+            "mirror.ccs.tencentyun.com"
+            "docker.m.ixdev.cn"
+        )
+        local mirror_found=""
+        for mirror in "${mirrors[@]}"; do
+            info "Testing mirror tag existence: ${mirror}/frappe/erpnext:${BASE_TAG}"
+            # 使用 Docker Hub API 兼容鏡像方式檢查 (如有 API 可用)
+            # 這裡簡化：假設鏡像存在，如果不可達會 fallback 到 BASE_TAG
+            if curl -s --max-time 3 "https://${mirror}/v2/frappe/erpnext/manifests/${BASE_TAG}" -o /dev/null; then
+                docker_base="${mirror}/frappe/erpnext"
+                mirror_found="$mirror"
+                info "✅ Found usable mirror: ${docker_base}:${BASE_TAG}"
+                break
+            else
+                warn "Mirror ${mirror} unreachable or tag not found."
+            fi
+        done
+
+        if [[ -z "$mirror_found" ]]; then
+            warn "❌ All mirrors failed. Will use BASE_TAG=${BASE_TAG} (build may fail)."
+        fi
+    fi
+
+    # -------------------------------
+    # 設置最終 FROM 行
+    # -------------------------------
+    local from_line="FROM ${docker_base}:${erpnext_ver}"
+    info "Final base image: ${from_line}"
+
+    # -------------------------------
+    # 檢查 wheels
+    # -------------------------------
+    local wheels_copy=""
+    if [ -d "$PROJECT_DIR/wheels" ]; then
+        local wheel_files=("$PROJECT_DIR/wheels"/*.whl)
+        if [ -e "${wheel_files[0]}" ]; then
+            info "Found wheels files, will include them in Docker build..."
+            wheels_copy="COPY wheels/*.whl /wheels/
+RUN pip install --no-cache-dir /wheels/*.whl"
+        fi
+    fi
+
+    # -------------------------------
+    # 判斷是否用 GitHub 源
+    # -------------------------------
+    local erpnext_ver_num=$(echo "$erpnext_ver" | sed 's/^v//')
+    local github_ver_num=$(echo "$github_erpnext_ver" | sed 's/^v//')
+    local use_github=false
+    if [ "$(printf '%s\n' "$github_ver_num" "$erpnext_ver_num" | sort -V | tail -n1)" = "$github_ver_num" ] && [ "$github_ver_num" != "$erpnext_ver_num" ]; then
+        use_github=true
+    fi
+
+    local extra_clone=""
+    if [ "$use_github" = true ]; then
+        auto_detect_app_versions
+        github_erpnext_ver=${ERPNEXT_BRANCH}
+        erpnext_ver=${ERPNEXT_BRANCH}
+        ERPNEXT_VERSION=${ERPNEXT_BRANCH}
+        info "Using GitHub source for ERPNext: ${github_erpnext_ver}"
+        extra_clone="RUN rm -rf apps/erpnext && git clone --depth 1 --branch ${github_erpnext_ver} https://github.com/frappe/erpnext /home/frappe/frappe-bench/apps/erpnext
+RUN npm install --prefix apps/erpnext onscan.js
+RUN npm install -g npm@latest && npm install esbuild@latest && npx update-browserslist-db@latest"
+    else
+        info "Using base image: ${docker_base}:${erpnext_ver}"
+    fi
+
+    # -------------------------------
+    # 生成 Dockerfile.custom
+    # -------------------------------
+    cat > Dockerfile.custom <<EOF
+ARG ERPNEXT_VERSION=${erpnext_ver}
+$from_line
+
+ENV NODE_OPTIONS="--max-old-space-size=12288"
+ENV FRAPPE_REDIS_NO_SEARCH=1
+
+USER root
+RUN apt-get update && apt-get install -y git pkg-config default-libmysqlclient-dev build-essential mariadb-client curl unzip jq \
+    && pip install --no-cache-dir wechatpy apprise \
+    && rm -rf /var/lib/apt/lists/*
+
+$wheels_copy
+
+USER frappe
+WORKDIR /home/frappe/frappe-bench
+
+$extra_clone
+
+RUN mkdir -p sites && echo '{"socketio_port": 9000}' > sites/common_site_config.json
+
+# Download apps
+RUN bench get-app --branch ${TELEPHONY_BRANCH} https://github.com/frappe/telephony --skip-assets \
+    && bench get-app --branch ${HRMS_BRANCH} https://github.com/frappe/hrms --skip-assets \
+    && bench get-app --branch ${HELP_DESK_BRANCH} https://github.com/frappe/helpdesk --skip-assets \
+    && bench get-app --branch ${PRINT_DESIGNER_BRANCH} https://github.com/frappe/print_designer --skip-assets \
+    && bench get-app --branch ${INSIGHTS_BRANCH} https://github.com/frappe/insights --skip-assets \
+    && bench get-app --branch ${DRIVE_BRANCH} https://github.com/frappe/drive --skip-assets \
+    && bench get-app --branch develop https://github.com/frappe/wiki --skip-assets \
+    && bench get-app --branch ${LMS_BRANCH} https://github.com/frappe/lms --skip-assets \
+    && bench get-app --branch ${BUILDER_BRANCH} https://github.com/frappe/builder --skip-assets
+
+# Install app dependencies
+RUN if [ -f /home/frappe/frappe-bench/apps/wiki/requirements.txt ]; then pip install --no-cache-dir -r /home/frappe/frappe-bench/apps/wiki/requirements.txt; fi \
+    && if [ -f /home/frappe/frappe-bench/apps/lms/requirements.txt ]; then pip install --no-cache-dir -r /home/frappe/frappe-bench/apps/lms/requirements.txt; fi \
+    && if [ -f /home/frappe/frappe-bench/apps/builder/requirements.txt ]; then pip install --no-cache-dir -r /home/frappe/frappe-bench/apps/builder/requirements.txt; fi \
+    && pip install --no-cache-dir pandas==2.2.2 beautifulsoup4==4.13.4 Markdown==3.8.2 redis==4.5.4
+
+# Install Node.js dependencies
+RUN cd /home/frappe/frappe-bench/apps/lms && yarn install --check-files \
+    && cd frontend && yarn install --check-files \
+    && yarn add @tiptap/core@2.7.0 sortablejs@1.14.0 workbox-build@7.3.0 workbox-window@7.3.0 highlight.js@11.0.0
+RUN cd /home/frappe/frappe-bench/apps/builder && yarn install --check-files \
+    && cd frontend && yarn install --check-files \
+    && yarn add @tiptap/core@2.7.0 sortablejs@1.14.0 workbox-build@7.3.0 workbox-window@7.3.0 highlight.js@11.0.0
+
+# Build apps
+RUN bench build --app frappe --verbose || { cat /home/frappe/frappe-bench/logs/*; exit 1; } \
+    && bench build --app erpnext \
+    && bench build --app telephony \
+    && bench build --app print_designer \
+    && bench build --app helpdesk \
+    && bench build --app insights \
+    && bench build --app drive \
+    && bench build --app wiki --verbose || { cat /home/frappe/frappe-bench/logs/*; exit 1; } \
+    && bench build --app lms --verbose || { cat /home/frappe/frappe-bench/logs/*; exit 1; } \
+    && bench build --app builder
+EOF
+
+    info "✅ Dockerfile.custom generated successfully!"
+}
+
+
+# ---------- Build custom image ----------
+build_custom_image() {
+    info "Building custom image ${CUSTOM_IMAGE}:${CUSTOM_TAG} with BASE_TAG=${BASE_TAG} ..."
+    generate_custom_dockerfile
+
+    local build_opts=(--build-arg ERPNEXT_VERSION="${BASE_TAG}" -t "${CUSTOM_IMAGE}:${CUSTOM_TAG}" -f Dockerfile.custom)
+    # default: pull base to get latest security fixes
+    build_opts=(--pull "${build_opts[@]}")
+
+    docker build "${build_opts[@]}" .
+    send_alert "Built image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}"
+    info "Built image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}"
+    # update .env to persist custom image usage if desired
+    if grep -q '^CUSTOM_IMAGE=' "$ENV_FILE"; then
+        sed -i "s|^CUSTOM_IMAGE=.*|CUSTOM_IMAGE=${CUSTOM_IMAGE}|" "$ENV_FILE"
+    else
+        echo "CUSTOM_IMAGE=${CUSTOM_IMAGE}" >> "$ENV_FILE"
+    fi
+    if grep -q '^CUSTOM_TAG=' "$ENV_FILE"; then
+        sed -i "s|^CUSTOM_TAG=.*|CUSTOM_TAG=${CUSTOM_TAG}|" "$ENV_FILE"
+    else
+        echo "CUSTOM_TAG=${CUSTOM_TAG}" >> "$ENV_FILE"
+    fi
+}
+
+# ---------- Wait for MariaDB root to accept password ----------
+wait_for_mariadb_root() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local tries=0
+    local max=30
+    info "Waiting for MariaDB to accept root password (try up to ${max})..."
+    while true; do
+        if docker compose ${compose_files} --env-file .env exec -T db mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "SELECT 1;" &>/dev/null; then
+            info "MariaDB root auth OK"
+            return 0
+        fi
+        tries=$((tries+1))
+        if [ "$tries" -ge "$max" ]; then
+            warn "MariaDB root auth failed after ${max} attempts"
+            return 1
+        fi
+        sleep 3
+    done
+}
+
+# ---------- Ensure frappe DB user exists and matches DB_PASSWORD ----------
+ensure_frappe_db_user() {
+    local compose_files
+    compose_files=$(get_compose_files)
+
+    local DB_USER=${MYSQL_USER:-frappe}
+    local DB_PASS="${DB_PASSWORD:-${MYSQL_ROOT_PASSWORD}}"
+    local DB_NAME=${MYSQL_DATABASE:-${DB_NAME:-'frappe'}}
+
+    info "Ensuring DB user '${DB_USER}' exists with provided password..."
+    docker compose ${compose_files} --env-file .env exec -T db mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "\
+        CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}'; \
+        ALTER USER '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}'; \
+        GRANT ALL PRIVILEGES ON *.* TO '${DB_USER}'@'%' WITH GRANT OPTION; \
+        FLUSH PRIVILEGES;" &>/dev/null || {
+        warn "Failed to ensure DB user '${DB_USER}' via root. Will continue but DB auth problems may persist."
+        return 1
+    }
+    info "DB user '${DB_USER}' ensured"
+    return 0
+}
+# ---------- check mysql user ----------
+check_mysql_user() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local site_name="${SITE_NAME}"
+
+    info "Checking MariaDB user for site '${site_name}'..."
+
+    # 从 backend 容器读取 site_config.json
+    local SITE_JSON
+    if ! SITE_JSON=$(docker compose ${compose_files} --env-file .env exec -T backend cat "sites/${site_name}/site_config.json" 2>/dev/null); then
+        warn "Failed to read site_config.json from backend container."
+        return 1
+    fi
+    if [ -z "$SITE_JSON" ]; then
+        warn "site_config.json not found or empty in backend container for site ${site_name}"
+        return 1
+    fi
+
+    # 检查并设置 host_name
+    if [ -z "$HOSTNAME" ]; then
+        warn "SITE_HOSTNAME is not set in .env, and no default hostname provided. Skipping host_name update."
+    else
+        if ! echo "$SITE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('host_name',''))" 2>/dev/null | grep -q .; then
+            info "host_name not found in site_config.json, adding '${HOSTNAME}'..."
+
+            docker compose ${compose_files} --env-file .env exec -T backend python3 - <<PYCODE
+import json, pathlib
+path = pathlib.Path("sites/${site_name}/site_config.json")
+try:
+    data = json.loads(path.read_text())
+    data['host_name'] = '${HOSTNAME}'
+    path.write_text(json.dumps(data, indent=1))
+    print("Added host_name '${HOSTNAME}' to site_config.json successfully.")
+except Exception as e:
+    print("⚠️ Failed to add host_name to site_config.json:", e)
+PYCODE
+        else
+            local CURRENT_HOSTNAME
+            CURRENT_HOSTNAME=$(echo "$SITE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('host_name',''))" 2>/dev/null || true)
+            if [ "$CURRENT_HOSTNAME" != "$HOSTNAME" ]; then
+                info "host_name exists but is incorrect ('${CURRENT_HOSTNAME}'), updating to '${HOSTNAME}'..."
+
+                docker compose ${compose_files} --env-file .env exec -T backend python3 - <<PYCODE
+import json, pathlib
+path = pathlib.Path("sites/${site_name}/site_config.json")
+try:
+    data = json.loads(path.read_text())
+    data['host_name'] = '${HOSTNAME}'
+    path.write_text(json.dumps(data, indent=1))
+    print("Updated host_name to '${HOSTNAME}' in site_config.json successfully.")
+except Exception as e:
+    print("⚠️ Failed to update host_name in site_config.json:", e)
+PYCODE
+            else
+                info "host_name '${CURRENT_HOSTNAME}' is already correct in site_config.json."
+            fi
+        fi
+    fi
+	
+    # 检查是否存在 SaaS 限制字段 user_type_doctype_limit，并清理
+    if docker compose ${compose_files} --env-file .env exec -T backend grep -q '"user_type_doctype_limit"' "sites/${site_name}/site_config.json"; then
+        info "Removing SaaS restriction field 'user_type_doctype_limit' from site_config.json..."
+
+        docker compose ${compose_files} --env-file .env exec -T backend python3 - <<PYCODE
+import json, pathlib
+path = pathlib.Path("sites/${site_name}/site_config.json")
+try:
+    data = json.loads(path.read_text())
+    if "user_type_doctype_limit" in data:
+        data.pop("user_type_doctype_limit", None)
+        path.write_text(json.dumps(data, indent=1))
+        print("Cleaned site_config.json successfully.")
+except Exception as e:
+    print("⚠️ Failed to clean site_config.json:", e)
+PYCODE
+    fi
+	
+    # 提取数据库名和密码
+    local DB_NAME DB_PASS DB_USER
+    DB_NAME=$(echo "$SITE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('db_name',''))" 2>/dev/null || true)
+    DB_PASS=$(echo "$SITE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('db_password',''))" 2>/dev/null || true)
+    DB_USER=${DB_NAME:-frappe}
+
+    if [ -z "$DB_NAME" ] || [ -z "$DB_PASS" ]; then
+        warn "Could not parse db_name or db_password from site_config.json"
+        return 1
+    fi
+
+    info "Verifying MariaDB user '${DB_USER}' connectivity..."
+
+    if docker compose ${compose_files} --env-file .env exec -T db mariadb -u"${DB_USER}" -p"${DB_PASS}" -D"${DB_NAME}" -e "SELECT 1;" &>/dev/null; then
+        info "User '${DB_USER}' can connect and has access — nothing to do."
+    else
+        warn "User '${DB_USER}' cannot connect — attempting to create/update via root..."
+
+        docker compose ${compose_files} --env-file .env exec -T db mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "\
+                DROP USER IF EXISTS '${DB_USER}'@'%';\
+                CREATE USER '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}';\
+                GRANT ALL PRIVILEGES ON *.* TO '${DB_USER}'@'%' WITH GRANT OPTION;\
+                FLUSH PRIVILEGES;" \
+        && info "User '${DB_USER}' created/updated successfully." \
+        || warn "Failed to create/update user '${DB_USER}' via root."
+    fi
+
+    info "Verifying updated grants for '${DB_USER}'..."
+    docker compose ${compose_files} --env-file .env exec -T db mariadb -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "SHOW GRANTS FOR '${DB_USER}'@'%';" || true
+}
+
+# ---------- Independent Site Health Verification Function ----------
+# Usage: verify_site_health [SITE_NAME] [optional: --strict] [optional: --log-file]
+# Returns 0 if healthy, 1 if issues found. For production monitoring.
+verify_site_health() {
+    local site_name="${1:-${SITE_NAME}}"
+    local strict_mode=false
+    local health_log="${PROJECT_DIR}/health_check.log"
+    shift
+    info "checking log file $health_log..."
+    # Parse optional args
+    while [[ $# -gt 0 && $1 == --* ]]; do
+        case $1 in
+            --strict)
+                strict_mode=true
+                shift ;;
+            --log-file)
+                health_log="$2"
+                shift 2 ;;
+            *)
+                warn "Unknown arg: $1 - ignoring"
+                shift ;;
+        esac
+    done
+
+    local compose_files
+    compose_files=$(get_compose_files)
+
+    echo "[$(date)] Health check started for site '${site_name}'" >> "$health_log"
+    local health_ok=true
+
+    # 1. Verify apps installation
+    info "Verifying app installation for site '${site_name}'..."
+    local installed_apps
+    installed_apps=$(docker compose ${compose_files} --env-file .env exec -T backend bench --site "${site_name}" list-apps 2>/dev/null || echo "")
+    local expected_apps="erpnext telephony hrms helpdesk print_designer insights drive"
+    local missing_apps=""
+    for app in $expected_apps; do
+        if ! echo "$installed_apps" | grep -q "^$app[[:space:]]"; then
+            missing_apps="$missing_apps $app"
+        fi
+    done
+    if [ -n "$missing_apps" ]; then
+        health_ok=false
+        error "Missing apps: $missing_apps. Installed: $installed_apps"
+        echo "Missing apps: $missing_apps" >> "$health_log"
+        [ "$strict_mode" = true ] && return 1
+    else
+        info "All apps verified successfully installed ✅"
+    fi
+
+    # 2. bench doctor for scheduler health
+    info "Running bench doctor for scheduler health check..."
+    local doctor_output
+    doctor_output=$(docker compose ${compose_files} --env-file .env exec -T backend bench doctor 2>&1 || echo "Error running bench doctor")
+    echo "$doctor_output" >> "$health_log"
+    if echo "$doctor_output" | grep -q "Workers online: [0-9]\+" || echo "$doctor_output" | grep -q "No issues"; then
+        info "Scheduler health OK ✅"
+    else
+        health_ok=false
+        error "Scheduler issues detected: $doctor_output"
+        [ "$strict_mode" = true ] && return 1
+    fi
+
+    # 3. Optional: Quick migrate check (schema sync)
+    info "Running quick migrate check..."
+    local migrate_output
+    migrate_output=$(docker compose ${compose_files} --env-file .env exec -T backend bench --site "${site_name}" migrate 2>&1 || echo "Error running bench migrate")
+    echo "$migrate_output" >> "$health_log"
+    if echo "$migrate_output" | grep -q -E "Error|Traceback"; then
+        health_ok=false
+        warn "Migrate step failed - check manually: $migrate_output"
+    else
+        info "Schema up-to-date ✅"
+    fi
+
+    # 4. DB connectivity (reuse check_mysql_user)
+    info "Verifying DB connectivity..."
+    if check_mysql_user "${site_name}"; then
+        info "DB connectivity OK ✅"
+    else
+        health_ok=false
+        error "DB connectivity issues detected."
+        [ "$strict_mode" = true ] && return 1
+    fi
+
+    if [ "$health_ok" = true ]; then
+        info "Site '${site_name}' health check passed - Production Ready ✅"
+        echo "[$(date)] Health check passed for site '${site_name}'" >> "$health_log"
+        return 0
+    else
+        error "Site '${site_name}' health check failed - Review $health_log for details."
+        echo "[$(date)] Health check failed for site '${site_name}'" >> "$health_log"
+        return 1
+    fi
+}
+
+# -------------------------------
+# 用於檢查多個端口
+# -------------------------------
+check_port() {
+    local port=$1
+    if ss -tln | awk '{print $4}' | grep -q ":$port$"; then
+        warn "⚠️ Port $port is already in use"
+        return 1
+    else
+        info "✅ Port $port is free"
+        return 0
+    fi
+}
+
+check_required_ports() {
+    local ports=("$@")
+    local conflict=false
+    for p in "${ports[@]}"; do
+        if ! check_port "$p"; then
+            conflict=true
+        fi
+    done
+
+    if [[ "$conflict" == true ]]; then
+        error "One or more required host ports are in use. Please free them before deploying."
+        exit 1
+    fi
+}
+
+# ---------- Deploy stack ----------
+deploy_stack() {
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    echo "[$(date)] Starting deployment for site '${SITE_NAME}'" >> "$deploy_log"
+    check_required_ports ${HTTP_PUBLISH_PORT:-8080}
+    check_required_files
+    local compose_files
+    compose_files=$(get_compose_files)
+
+    info "Bringing up DB and Redis first..."
+    docker compose ${compose_files} --env-file .env up -d db redis-cache redis-queue #>> "$deploy_log" 2>&1
+    sleep 5
+
+    if ! wait_for_mariadb_root; then
+        error "MariaDB root auth failed - critical for production. Check logs: tail -f $deploy_log"
+        exit 1
+    else
+        ensure_frappe_db_user || {
+            error "DB user setup failed - aborting deployment."
+            exit 1
+        }
+    fi
+
+    info "Bringing up remaining services..."
+    docker compose ${compose_files} --env-file .env up -d --remove-orphans #>> "$deploy_log" 2>&1
+    info "All services started (docker compose up -d). Waiting for backend to be ready..."
+
+    local tries=0
+    local max=30
+    while true; do
+        if docker compose ${compose_files} --env-file .env exec -T backend bench --version &>/dev/null; then
+            info "Backend bench responsive"
+            break
+        fi
+        tries=$((tries+1))
+        if [ "$tries" -ge "$max" ]; then
+            error "Backend not responsive after $max tries - critical failure."
+            exit 1
+        fi
+        sleep 5
+    done
+
+    # Pre-backup if site exists
+    cmd_backup
+
+    info "Checking if site '${SITE_NAME}' exists..."
+    if ! docker compose ${compose_files} --env-file .env exec -T backend test -f "sites/${SITE_NAME}/site_config.json" >/dev/null 2>&1 || \
+       ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" list-apps &>/dev/null; then
+        info "Creating new site: ${SITE_NAME}"
+        if ! docker compose ${compose_files} --env-file .env exec -T backend bench new-site "${SITE_NAME}" \
+            --admin-password "${ADMIN_PASSWORD:-admin}" \
+            --mariadb-root-username root \
+            --mariadb-root-password "${MYSQL_ROOT_PASSWORD}" \
+            --install-app erpnext \
+            --set-default >> "$deploy_log" 2>&1; then
+            error "bench new-site failed - aborting."
+            exit 1
+        fi
+
+        # Install apps with retry
+        local install_success=true
+        for app in frappe erpnext telephony hrms helpdesk print_designer insights drive wiki lms builder; do
+            info "Attempting to install app: ${app} (with retry if needed)"
+            if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" install-app "${app}" >> "$deploy_log" 2>&1; then
+                info "Retry installing ${app}..."
+                if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" install-app "${app}" >> "$deploy_log" 2>&1; then
+                    error "install-app ${app} failed after retry - critical for production."
+                    install_success=false
+                fi
+            fi
+        done
+
+        if [ "$install_success" = false ]; then
+            error "One or more apps failed to install - aborting deployment. Check $deploy_log"
+            exit 1
+        fi
+
+        # Run migrate after all installs to sync schema
+        info "Running bench migrate for site '${SITE_NAME}'..."
+        if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" migrate >> "$deploy_log" 2>&1; then
+            error "bench migrate failed - schema sync critical."
+            exit 1
+        fi
+    else
+        info "Site ${SITE_NAME} already exists - performing update..."
+        # Update existing site
+        info "Running bench update for site '${SITE_NAME}'..."
+        if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" migrate >> "$deploy_log" 2>&1; then
+            warn "bench update failed - manual intervention may be required. Check $deploy_log"
+        else
+            info "Site '${SITE_NAME}' updated successfully."
+        fi
+        # Rebuild assets
+        info "Rebuilding assets for site '${SITE_NAME}'..."
+        if ! docker compose ${compose_files} --env-file .env exec -T backend bench --site "${SITE_NAME}" build --force >> "$deploy_log" 2>&1; then
+            warn "Asset rebuild failed - check $deploy_log for details."
+        fi
+    fi
+
+    check_mysql_user
+    info "Stopping ..."
+    docker compose ${compose_files} --env-file .env down
+    info "Upping ..."
+    docker compose ${compose_files} --env-file .env up -d
+
+    # Final: Run full health verification
+    info "Running production health verification..."
+    if ! verify_site_health "${SITE_NAME}" --strict --log-file "$deploy_log"; then
+        error "Health verification failed - deployment aborted. Check $deploy_log"
+        exit 1
+    fi
+
+    # Final: Restart workers
+    info "Restarting bench workers..."
+    docker compose ${compose_files} --env-file .env exec -T backend bench restart >> "$deploy_log" 2>&1 || warn "Workers restart non-critical"
+
+    check_mysql_user
+    info "Deployment completed - Production Ready ✅"
+    echo "[$(date)] Deployment successful for site '${SITE_NAME}'" >> "$deploy_log"
+	send_alert "[$(date)] Deployment successful for site '${SITE_NAME}'"
+}
+
+# ---------- Helper: check required files ----------
+check_required_files() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local missing_files=()
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+
+    # Check for .env file
+    if [ ! -f "$ENV_FILE" ]; then
+        missing_files+=("$ENV_FILE")
+    elif [ ! -r "$ENV_FILE" ]; then
+        missing_files+=("$ENV_FILE (not readable)")
+    fi
+
+    # Check for required Docker Compose files
+    local file
+    for file in $(echo "$compose_files" | tr ' ' '\n' | grep -o '\-f \S*' | cut -d' ' -f2); do
+        if [ ! -f "$file" ]; then
+            missing_files+=("$file")
+        elif [ ! -r "$file" ]; then
+            missing_files+=("$file (not readable)")
+        fi
+    done
+
+    # Check for optional wheels directory if it exists
+    if [ -d "$PROJECT_DIR/wheels" ] && [ -z "$(ls -A "$PROJECT_DIR/wheels"/*.whl 2>/dev/null)" ]; then
+        warn "Wheels directory exists but contains no .whl files: $PROJECT_DIR/wheels"
+    fi
+
+    # Verify key environment variables in .env
+    local required_vars=("MYSQL_ROOT_PASSWORD" "WECHAT_CORPID" "WECHAT_AGENTID" "WECHAT_SECRET" "WECHAT_TOUSER")
+    local missing_vars=()
+    for var in "${required_vars[@]}"; do
+        if ! grep -q "^${var}=" "$ENV_FILE"; then
+            missing_vars+=("$var")
+        fi
+    done
+
+    if [ ${#missing_vars[@]} -gt 0 ]; then
+        error "Required environment variables missing in $ENV_FILE: ${missing_vars[*]}"
+        send_alert "Deployment failed for ${SITE_NAME}: Missing environment variables: ${missing_vars[*]}. Check $deploy_log"
+        exit 1
+    fi
+
+    if [ ${#missing_files[@]} -gt 0 ]; then
+        error "Required files are missing or not readable: ${missing_files[*]}"
+        send_alert "Deployment failed for ${SITE_NAME}: Missing required files: ${missing_files[*]}. Check $deploy_log"
+        exit 1
+    fi
+
+    info "All required files and environment variables verified successfully"
+}
+
+# ---------- Commands ----------
+cmd_deploy() {
+    check_required_files
+    deploy_stack
+}
+cmd_build_custom_image() {
+    check_required_files
+    build_custom_image
+}
+cmd_start() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    info "Starting all services safely..."
+    docker compose ${compose_files} --env-file .env up -d
+    check_mysql_user
+}
+cmd_stop() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env down
+}
+cmd_restart() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    info "Restarting all services safely..."
+    docker compose ${compose_files} --env-file $ENV_FILE restart
+    local tries=0; local max=30
+    while true; do
+        if docker compose ${compose_files} --env-file .env exec -T backend bench --version &>/dev/null; then
+            info "Backend ready"
+            break
+        fi
+        tries=$((tries+1))
+        if [ "$tries" -ge "$max" ]; then
+            warn "Backend not ready after ${max} tries"
+            break
+        fi
+        sleep 5
+    done
+    check_mysql_user
+    info "Restart completed"
+}
+cmd_logs() {
+    local svc=${2:-backend}
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env logs -f --tail=200 "${svc}"
+}
+cmd_status() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env ps
+}
+cmd_cleanup() {
+    cleanup_tmp
+    info "Temp files removed"
+}
+cmd_force_cleanup() {
+    info "Force cleanup: stopping containers, removing volumes and unused data (DANGEROUS)"
+    local compose_files
+    compose_files=$(get_compose_files)
+    docker compose ${compose_files} --env-file .env down -v --remove-orphans || true
+    docker system prune -af --volumes || true
+    info "Force cleanup done"
+}
+cmd_rebuild_and_deploy() {
+    cmd_force_cleanup
+    cmd_build_custom_image
+    cmd_deploy
+}
+
+cmd_redeploy() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+
+    # Check if backend container is running
+    info "Checking if backend container is running..."
+    local backend_status
+    backend_status=$(docker compose ${compose_files} --env-file .env ps --services --filter "status=running" | grep backend || true)
+    if [ -z "$backend_status" ]; then
+        warn "Backend container is not running. Attempting to start services..."
+        if ! docker compose ${compose_files} --env-file .env up -d >> "$deploy_log" 2>&1; then
+            error "Failed to start services - check $deploy_log for details."
+            echo "[$(date)] Failed to start services for redeploy" >> "$deploy_log"
+            exit 1
+        fi
+        # Wait for backend to be ready
+        local tries=0
+        local max=30
+        while true; do
+            if docker compose ${compose_files} --env-file .env exec -T backend bench --version &>/dev/null; then
+                info "Backend container is ready"
+                break
+            fi
+            tries=$((tries+1))
+            if [ "$tries" -ge "$max" ]; then
+                error "Backend container not ready after $max tries - aborting redeploy."
+                echo "[$(date)] Backend container not ready after $max tries" >> "$deploy_log"
+                exit 1
+            fi
+            sleep 5
+        done
+    else
+        info "Backend container is running ✅"
+    fi
+    echo "[$(date)] Backend container status check completed" >> "$deploy_log"
+
+    # Confirm before dropping site (dangerous in production)
+    read -p "DANGER: This will DROP site '${SITE_NAME}' and recreate it, LOSING ALL DATA. Continue? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        warn "Redeploy cancelled by user."
+        echo "[$(date)] Redeploy cancelled by user" >> "$deploy_log"
+        return 1
+    fi
+
+    # Backup before drop
+    info "Backing up site '${SITE_NAME}' before drop..."
+    cmd_backup
+	
+    #停止并清理容器卷
+	local compose_files
+    compose_files=$(get_compose_files)
+	info "Stopping ..."
+    docker compose ${compose_files} --env-file .env down -v
+	info "Upping ..."	
+	docker compose ${compose_files} --env-file .env up -d --build
+	
+    info "Dropping existing site '${SITE_NAME}'..."
+    if docker compose ${compose_files} --env-file .env exec -T backend bench drop-site "${SITE_NAME}" --root-password "${MYSQL_ROOT_PASSWORD}" >> "$deploy_log" 2>&1; then
+        info "Site '${SITE_NAME}' dropped successfully."
+        echo "[$(date)] Site '${SITE_NAME}' dropped successfully" >> "$deploy_log"
+    else
+        warn "Site drop failed or site not found - proceeding to create new."
+        echo "[$(date)] Site drop failed or site not found for '${SITE_NAME}'" >> "$deploy_log"
+    fi
+
+    # Now recreate and deploy
+    info "Re-creating and deploying site '${SITE_NAME}'..."
+    cmd_deploy
+}
+
+# ---- Backup site (v15 stable) ----
+cmd_backup() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    local site_name="${SITE_NAME}"
+    local safe_site_name="${site_name//./_}"  # 点号换下划线
+    local backup_dir="sites/${site_name}/private/backups"
+
+    info "Backing up site '${site_name}'..."
+    if docker compose ${compose_files} --env-file .env exec -T backend \
+        bench --site "${site_name}" backup >> "$deploy_log" 2>&1; then
+
+        info "Backup finished inside container. Listing generated files:"
+        docker compose ${compose_files} --env-file .env exec -T backend ls -lh "${backup_dir}" | tail -n +2
+
+        # 找出最新的数据库文件前缀
+        local latest_prefix
+        latest_prefix=$(docker compose ${compose_files} --env-file .env exec -T backend \
+            ls -t "${backup_dir}" | grep "${safe_site_name}-database.sql.gz" | head -n 1 | sed 's/-database\.sql\.gz$//')
+
+        if [ -n "$latest_prefix" ]; then
+            mkdir -p "${PROJECT_DIR}/backups"
+            local backup_files=(
+                "${latest_prefix}-database.sql.gz"
+                "${latest_prefix}-site_config_backup.json"
+                "${latest_prefix}-files.tar"
+                "${latest_prefix}-private-files.tar"
+            )
+
+            for f in "${backup_files[@]}"; do
+                if docker compose ${compose_files} --env-file .env exec -T backend test -f "${backup_dir}/${f}" 2>/dev/null; then
+                    docker compose ${compose_files} --env-file .env cp \
+                        "backend:/home/frappe/frappe-bench/${backup_dir}/${f}" "${PROJECT_DIR}/backups/" || true
+                else
+                    info "Skipping missing file: ${f}"
+                fi
+            done
+
+            info "Backup files copied to host: ${PROJECT_DIR}/backups/"
+			local container_backup_dir="/home/frappe/frappe-bench/sites/${site_name}/private/backups"
+            docker compose ${compose_files} --env-file .env exec -T backend sh -c \
+            "rm -rf ${container_backup_dir}/* && ls -lh ${container_backup_dir}" >> "$deploy_log" 2>&1 \
+            && info "Container backup files cleared successfully." \
+            || warn "Failed to clear container backup files."
+
+        else
+            warn "No backup files found in container - check $deploy_log"
+        fi
+    else
+        warn "Backup failed for ${site_name}"
+    fi
+}
+
+# ---- Restore site (v15 stable, TCP DB) ----
+cmd_restore_backup() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    local site_name="${SITE_NAME}"
+    local safe_site_name="${site_name//./_}"
+    local backup_dir="sites/${site_name}/private/backups"
+
+    mkdir -p "${PROJECT_DIR}/backups"
+
+    # Check if backend is running
+    if ! docker compose ${compose_files} --env-file .env ps --services --filter "status=running" | grep -q backend; then
+        error "Backend container is not running. Start services with './deploy-official-with-apps-fixed_v25.sh start'"
+        echo "[$(date)] Backend not running for restore" >> "$deploy_log"
+        send_alert "Failed to restore backup for site '${site_name}': Backend not running"
+        exit 1
+    fi
+
+    # Check if database is running
+    if ! docker compose ${compose_files} --env-file .env ps --services --filter "status=running" | grep -q db; then
+        error "Database container is not running. Start services with './deploy-official-with-apps-fixed_v25.sh start'"
+        echo "[$(date)] Database not running for restore" >> "$deploy_log"
+        send_alert "Failed to restore backup for site '${site_name}': Database not running"
+        exit 1
+    fi
+
+    # List available database backup prefixes
+    info "Listing available backups in ${PROJECT_DIR}/backups..."
+    local backup_prefixes
+    backup_prefixes=$(ls -1 "${PROJECT_DIR}/backups" | grep "${safe_site_name}-database.sql.gz" | sed -E "s/-database\.sql\.gz//" | sort -r)
+
+    if [ -z "$backup_prefixes" ]; then
+        error "No backups found in ${PROJECT_DIR}/backups for site '${site_name}'"
+        echo "[$(date)] No backups found for site '${site_name}'" >> "$deploy_log"
+        send_alert "No backups found in ${PROJECT_DIR}/backups for site '${site_name}'"
+        exit 1
+    fi
+
+    # Display backups for user selection
+    info "Available backups:"
+    local backup_array=()
+    local index=1
+    while IFS= read -r prefix; do
+        echo "[$index] $prefix"
+        backup_array+=("$prefix")
+        ((index++))
+    done <<< "$backup_prefixes"
+
+    read -p "Enter the number of the backup to restore (1-${#backup_array[@]}): " -r selection
+    if [[ ! $selection =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#backup_array[@]}" ]; then
+        error "Invalid selection"
+        echo "[$(date)] Invalid backup selection for site '${site_name}'" >> "$deploy_log"
+        send_alert "Invalid backup selection for site '${site_name}'"
+        exit 1
+    fi
+
+    local selected_prefix=${backup_array[$((selection-1))]}
+    info "Selected backup: ${selected_prefix}"
+
+    # Copy site_config_backup.json to container
+    local local_config="${PROJECT_DIR}/backups/${selected_prefix}-site_config_backup.json"
+    if [ ! -f "$local_config" ]; then
+        error "Missing site_config_backup.json for selected backup"
+        echo "[$(date)] Missing site_config_backup.json for backup '${selected_prefix}'" >> "$deploy_log"
+        send_alert "Missing site_config_backup.json for backup '${selected_prefix}'"
+        exit 1
+    fi
+    docker compose ${compose_files} --env-file .env cp "$local_config" \
+        "backend:/home/frappe/frappe-bench/${backup_dir}/${selected_prefix}-site_config_backup.json" >> "$deploy_log" 2>&1 || {
+        error "Failed to copy site_config_backup.json to container"
+        echo "[$(date)] Failed to copy site_config_backup.json for backup '${selected_prefix}'" >> "$deploy_log"
+        send_alert "Failed to copy site_config_backup.json for backup '${selected_prefix}'"
+        exit 1
+    }
+
+    # Read database info from site_config_backup.json
+    local db_name db_password db_type db_host
+    read -r db_name db_password db_type <<< $(docker compose ${compose_files} --env-file .env exec -T backend \
+        bash -c "jq -r '[.db_name, .db_password, .db_type] | @tsv' ${backup_dir}/${selected_prefix}-site_config_backup.json") || {
+        error "Failed to read database info from site_config_backup.json"
+        echo "[$(date)] Failed to read database info for backup '${selected_prefix}'" >> "$deploy_log"
+        send_alert "Failed to read database info for backup '${selected_prefix}'"
+        exit 1
+    }
+
+    # Set DB host
+    db_host="db"  # Default docker-compose service name
+    if docker compose ${compose_files} --env-file .env exec -T backend \
+        bash -c "jq -e '.host_name' ${backup_dir}/${selected_prefix}-site_config_backup.json" >/dev/null 2>&1; then
+        db_host="db"  # Update if host_name is specified
+    fi
+
+    # Check if site exists, create if not
+    if ! docker compose ${compose_files} --env-file .env exec -T backend bash -c "ls /home/frappe/frappe-bench/sites | grep -q '^${site_name}\$'"; then
+        info "Site '${site_name}' does not exist. Creating site..."
+        echo "[$(date)] Creating site '${site_name}'" >> "$deploy_log"
+        if ! docker compose ${compose_files} --env-file .env exec -T backend \
+            bench new-site "${site_name}" --db-name "${db_name}" --db-password "${db_password}" --db-type "${db_type}" --no-mariadb-socket >> "$deploy_log" 2>&1; then
+            error "Failed to create site '${site_name}'. Check $deploy_log"
+            echo "[$(date)] Failed to create site '${site_name}'" >> "$deploy_log"
+            send_alert "Failed to create site '${site_name}' for backup restore"
+            exit 1
+        fi
+        # Copy site_config_backup.json to site directory
+        docker compose ${compose_files} --env-file .env exec -T backend \
+            bash -c "cp '${backup_dir}/${selected_prefix}-site_config_backup.json' '/home/frappe/frappe-bench/sites/${site_name}/site_config.json'" >> "$deploy_log" 2>&1 || {
+            error "Failed to copy site_config.json to site directory"
+            echo "[$(date)] Failed to copy site_config.json for site '${site_name}'" >> "$deploy_log"
+            send_alert "Failed to copy site_config.json for site '${site_name}'"
+            exit 1
+        }
+    fi
+
+    # Validate database backup integrity
+    local db_file="${PROJECT_DIR}/backups/${selected_prefix}-database.sql.gz"
+    if ! gzip -t "$db_file" >/dev/null 2>&1; then
+        error "Database backup file '${db_file}' is corrupted!"
+        echo "[$(date)] Database backup file '${db_file}' is corrupted" >> "$deploy_log"
+        send_alert "Database backup file '${db_file}' is corrupted"
+        exit 1
+    fi
+
+    # Copy database backup to container
+    docker compose ${compose_files} --env-file .env cp "$db_file" \
+        "backend:/home/frappe/frappe-bench/${backup_dir}/${selected_prefix}-database.sql.gz" >> "$deploy_log" 2>&1 || {
+        error "Failed to copy database backup to container"
+        echo "[$(date)] Failed to copy database backup '${selected_prefix}-database.sql.gz'" >> "$deploy_log"
+        send_alert "Failed to copy database backup '${selected_prefix}-database.sql.gz'"
+        exit 1
+    }
+
+# Restore database (TCP connection) with timeout
+info "Restoring database via TCP for site '${site_name}'..."
+echo "[$(date)] Restoring database for site '${site_name}'" >> "$deploy_log"
+
+# Step 1: Uncompress the backup file
+info "Step 1: Uncompressing database backup '${selected_prefix}-database.sql.gz'..."
+echo "[$(date)] Uncompressing database backup '${selected_prefix}-database.sql.gz'" >> "$deploy_log"
+local temp_sql_file="/home/frappe/frappe-bench/${backup_dir}/${selected_prefix}-database.sql"
+if ! docker compose ${compose_files} --env-file .env exec -T backend \
+    bash -c "timeout 300 gunzip -c '${backup_dir}/${selected_prefix}-database.sql.gz' > '${temp_sql_file}'" >> "$deploy_log" 2>&1; then
+    error "Failed to uncompress database backup. Check $deploy_log"
+    echo "[$(date)] Failed to uncompress database backup '${selected_prefix}-database.sql.gz'" >> "$deploy_log"
+    send_alert "Failed to uncompress database backup for site '${site_name}'. Check $deploy_log"
+    exit 1
+fi
+info "Database backup uncompressed successfully."
+
+# Step 2: Verify uncompressed SQL file
+info "Step 2: Verifying uncompressed SQL file..."
+echo "[$(date)] Verifying uncompressed SQL file '${temp_sql_file}'" >> "$deploy_log"
+if ! docker compose ${compose_files} --env-file .env exec -T backend \
+    bash -c "[ -s '${temp_sql_file}' ]" >> "$deploy_log" 2>&1; then
+    error "Uncompressed SQL file is empty or missing. Check $deploy_log"
+    echo "[$(date)] Uncompressed SQL file '${temp_sql_file}' is empty or missing" >> "$deploy_log"
+    send_alert "Uncompressed SQL file is empty or missing for site '${site_name}'"
+    docker compose ${compose_files} --env-file .env exec -T backend bash -c "rm -f '${temp_sql_file}'"
+    exit 1
+fi
+info "Uncompressed SQL file verified."
+
+# Step 3: Restore database
+info "Step 3: Importing database to MySQL..."
+echo "[$(date)] Importing database to MySQL for site '${site_name}'" >> "$deploy_log"
+if ! docker compose ${compose_files} --env-file .env exec -T backend \
+    bash -c "timeout 600 mysql -h ${db_host} -P 3306 -u '${db_name}' -p'${db_password}' '${db_name}' < '${temp_sql_file}'" >> "$deploy_log" 2>&1; then
+    error "Database restore failed - check $deploy_log"
+    echo "[$(date)] Database restore failed for site '${site_name}'" >> "$deploy_log"
+    send_alert "Database restore failed for site '${site_name}'. Check $deploy_log"
+    docker compose ${compose_files} --env-file .env exec -T backend bash -c "rm -f '${temp_sql_file}'"
+    exit 1
+fi
+info "Database restored successfully."
+
+# Clean up temporary SQL file
+docker compose ${compose_files} --env-file .env exec -T backend bash -c "rm -f '${temp_sql_file}'" >> "$deploy_log" 2>&1
+
+    # Restore files and private files
+    for tar_file in files.tar private-files.tar; do
+        local local_file="${PROJECT_DIR}/backups/${selected_prefix}-${tar_file}"
+        if [ -f "$local_file" ]; then
+            local target_dir="/home/frappe/frappe-bench/sites/${site_name}/"
+            [ "$tar_file" == "files.tar" ] && target_dir+="/public/files" || target_dir+="/private/files"
+            info "Restoring ${tar_file} to ${target_dir}..."
+            docker compose ${compose_files} --env-file .env cp "$local_file" \
+                "backend:/home/frappe/frappe-bench/${backup_dir}/${selected_prefix}-${tar_file}" >> "$deploy_log" 2>&1 || {
+                warn "Failed to copy ${tar_file} to container"
+                echo "[$(date)] Failed to copy ${tar_file} for site '${site_name}'" >> "$deploy_log"
+                send_alert "Failed to copy ${tar_file} for site '${site_name}'"
+                continue
+            }
+            docker compose ${compose_files} --env-file .env exec -T backend bash -c \
+                "mkdir -p '${target_dir}' && tar -xf '${backup_dir}/${selected_prefix}-${tar_file}' -C '${target_dir}'" >> "$deploy_log" 2>&1 \
+                && info "${tar_file} restored." || warn "Failed to restore ${tar_file}"
+        fi
+    done
+
+    # Run bench migrate to sync schema
+    info "Running bench migrate to sync schema..."
+    echo "[$(date)] Running bench migrate for site '${site_name}'" >> "$deploy_log"
+    if ! docker compose ${compose_files} --env-file .env exec -T backend \
+        bench --site "${site_name}" migrate >> "$deploy_log" 2>&1; then
+        error "Failed to run bench migrate after restore. Check $deploy_log"
+        echo "[$(date)] Failed to run bench migrate for site '${site_name}'" >> "$deploy_log"
+        send_alert "Failed to run bench migrate for site '${site_name}' after restore"
+        exit 1
+    fi
+
+    # Health verification
+    info "Running health verification..."
+    if ! verify_site_health "${site_name}" --strict --log-file "$deploy_log"; then
+        error "Health verification failed after restore"
+        echo "[$(date)] Health verification failed for site '${site_name}'" >> "$deploy_log"
+        send_alert "Health verification failed for site '${site_name}' after restore"
+        exit 1
+    fi
+
+    info "Restore completed - site '${site_name}' is ready ✅"
+    echo "[$(date)] Restore successful for site '${site_name}' using backup '${selected_prefix}'" >> "$deploy_log"
+    send_alert "Restore successful for site '${site_name}' using backup '${selected_prefix}'"
+}
+
+# ---------- Setup custom_batch_role app and deploy create_permissions.py ----------
+setup_custom_app() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    local site_name="${SITE_NAME}"
+    local app_name="custom_batch_role"
+    local service_name="backend"  # Assuming 'backend' is the service name, adjust if different
+
+    info "Setting up Custom App '${app_name}' for site '${site_name}'..."
+    echo "[$(date)] Setting up Custom App '${app_name}'" >> "$deploy_log"
+
+    # Check if backend is running
+    if ! docker compose ${compose_files} --env-file .env ps --services --filter "status=running" | grep -q "${service_name}"; then
+        error "Backend container is not running. Start services first with './deploy-official-with-apps-fixed_v25.sh start'"
+        echo "[$(date)] Backend not running for setup_custom_app" >> "$deploy_log"
+        send_alert "Failed to setup Custom App ${app_name}: Backend not running"
+        exit 1
+    fi
+
+    # Check file permissions for apps directory
+    info "Checking permissions for /home/frappe/frappe-bench/apps..."
+    echo "[$(date)] Checking permissions for /home/frappe/frappe-bench/apps" >> "$deploy_log"
+    if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+        bash -c "ls -ld /home/frappe/frappe-bench/apps" >> "$deploy_log" 2>&1; then
+        error "Failed to check permissions for /home/frappe/frappe-bench/apps. Check $deploy_log"
+        echo "[$(date)] Failed to check permissions for /home/frappe/frappe-bench/apps" >> "$deploy_log"
+        send_alert "Failed to check permissions for /home/frappe/frappe-bench/apps"
+        exit 1
+    fi
+
+    # Check disk space
+    info "Checking disk space for /home/frappe/frappe-bench..."
+    echo "[$(date)] Checking disk space for /home/frappe/frappe-bench" >> "$deploy_log"
+    if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+        bash -c "df -h /home/frappe/frappe-bench" >> "$deploy_log" 2>&1; then
+        error "Failed to check disk space for /home/frappe/frappe-bench. Check $deploy_log"
+        echo "[$(date)] Failed to check disk space for /home/frappe/frappe-bench" >> "$deploy_log"
+        send_alert "Failed to check disk space for /home/frappe/frappe-bench"
+        exit 1
+    fi
+
+    # Check if custom_batch_role app exists
+    if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" bench list-apps | grep -q "${app_name}"; then
+        info "Creating Custom App '${app_name}'..."
+        echo "[$(date)] Creating Custom App '${app_name}'" >> "$deploy_log"
+        if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+            bash -c "echo -e 'Custom Batch Role\nFrappe\nBatch role creation app\n🛠️\n#000000\ncontact@example.com\nMIT\nN\n' | timeout 60 bench new-app ${app_name}" >> "$deploy_log" 2>&1; then
+            error "Failed to create Custom App '${app_name}'. Check $deploy_log"
+            echo "[$(date)] Failed to create Custom App '${app_name}'" >> "$deploy_log"
+            send_alert "Failed to create Custom App ${app_name} for site '${site_name}'. Check $deploy_log"
+            exit 1
+        fi
+        info "Installing Custom App '${app_name}' on site '${site_name}'..."
+        echo "[$(date)] Installing Custom App '${app_name}'" >> "$deploy_log"
+        if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+            bench --site "${site_name}" install-app "${app_name}" >> "$deploy_log" 2>&1; then
+            error "Failed to install app '${app_name}'. Check $deploy_log"
+            echo "[$(date)] Failed to install app '${app_name}'" >> "$deploy_log"
+            send_alert "Failed to install custom app '${app_name}' on site '${site_name}'"
+            exit 1
+        fi
+        # Verify app registration
+        info "Verifying app '${app_name}' registration on site '${site_name}'..."
+        echo "[$(date)] Verifying app '${app_name}' registration" >> "$deploy_log"
+        if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+            bench --site "${site_name}" list-apps | grep -q "${app_name}"; then
+            error "App '${app_name}' not registered on site '${site_name}'. Check $deploy_log"
+            echo "[$(date)] App '${app_name}' not registered on site '${site_name}'" >> "$deploy_log"
+            send_alert "Failed to verify custom app '${app_name}' registration on site '${site_name}'"
+            exit 1
+        fi
+        info "App '${app_name}' successfully registered on site '${site_name}'."
+        echo "[$(date)] App '${app_name}' successfully registered" >> "$deploy_log"
+    else
+        info "Custom App '${app_name}' already exists."
+        echo "[$(date)] Custom App '${app_name}' already exists" >> "$deploy_log"
+        # Verify if app is registered on the site
+        info "Verifying app '${app_name}' registration on site '${site_name}'..."
+        echo "[$(date)] Verifying app '${app_name}' registration" >> "$deploy_log"
+        if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+            bench --site "${site_name}" list-apps | grep -q "${app_name}"; then
+            info "App '${app_name}' exists but not installed on site '${site_name}'. Installing..."
+            echo "[$(date)] App '${app_name}' not installed on site '${site_name}'. Installing..." >> "$deploy_log"
+            if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+                bench --site "${site_name}" install-app "${app_name}" >> "$deploy_log" 2>&1; then
+                error "Failed to install app '${app_name}'. Check $deploy_log"
+                echo "[$(date)] Failed to install app '${app_name}'" >> "$deploy_log"
+                send_alert "Failed to install custom app '${app_name}' on site '${site_name}'"
+                exit 1
+            fi
+            # Verify again after installation
+            if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+                bench --site "${site_name}" list-apps | grep -q "${app_name}"; then
+                error "App '${app_name}' not registered on site '${site_name}' after installation attempt. Check $deploy_log"
+                echo "[$(date)] App '${app_name}' not registered after installation attempt" >> "$deploy_log"
+                send_alert "Failed to verify custom app '${app_name}' registration on site '${site_name}'"
+                exit 1
+            fi
+            info "App '${app_name}' successfully installed and registered on site '${site_name}'."
+            echo "[$(date)] App '${app_name}' successfully installed and registered" >> "$deploy_log"
+        else
+            info "App '${app_name}' already registered on site '${site_name}'."
+            echo "[$(date)] App '${app_name}' already registered" >> "$deploy_log"
+        fi
+    fi
+
+    # Create module directory
+    info "Creating module directory for '${app_name}'..."
+    echo "[$(date)] Creating module directory for '${app_name}'" >> "$deploy_log"
+    if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+        bash -c "mkdir -p /home/frappe/frappe-bench/apps/${app_name}/${app_name}/module" >> "$deploy_log" 2>&1; then
+        error "Failed to create module directory for '${app_name}'. Check $deploy_log"
+        echo "[$(date)] Failed to create module directory for '${app_name}'" >> "$deploy_log"
+        send_alert "Failed to create module directory for ${app_name}. Check $deploy_log"
+        exit 1
+    fi
+
+    # Deploy create_permissions.py
+    info "Deploying create_permissions.py to '${app_name}'..."
+    echo "[$(date)] Deploying create_permissions.py to '${app_name}'" >> "$deploy_log"
+    # Create temporary file with Python script content
+    cat << 'EOF' > "${PROJECT_DIR}/create_permissions.py"
+import frappe
+
+def create_module_5roles(modules):
+    """Create five permission roles for non-single DocTypes in specified modules"""
+    if isinstance(modules, str):
+        module_list = [m.strip() for m in modules.split(",") if m.strip()]
+    elif isinstance(modules, list):
+        module_list = [m.strip() for m in modules if m.strip()]
+    else:
+        frappe.log_error("Invalid modules format, expected string or list", "create_module_5roles")
+        return False
+
+    if not module_list:
+        frappe.log_error("No valid modules provided", "create_module_5roles")
+        return False
+
+    doc_types = frappe.get_all(
+        "DocType",
+        filters={"module": ["in", module_list], "issingle": 0},
+        fields=["name"]
+    )
+    doc_types = [dt.name for dt in doc_types]
+    if not doc_types:
+        frappe.log_error(f"No document DocType found for modules: {', '.join(module_list)}", "create_module_5roles")
+        return False
+
+    permission_groups = {
+        "FullAccess": {
+            "select": 1, "read": 1, "write": 1, "create": 1, "delete": 1,
+            "submit": 1, "cancel": 1, "amend": 1,
+            "print": 1, "email": 1, "report": 1, "import": 1, "export": 1, "share": 1
+        },
+        "ReadOnly": {
+            "select": 1, "read": 1, "print": 1, "email": 1, "report": 1
+        },
+        "Operator": {
+            "select": 1, "read": 1, "write": 1, "create": 1, "submit": 1,
+            "print": 1, "email": 1, "report": 1,
+            "delete": 1, "cancel": 1, "amend": 1, "if_owner": 1
+        },
+        "Importer": {
+            "select": 1, "read": 1, "import": 1, "export": 1, "report": 1
+        },
+        "Sharer": {
+            "select": 1, "read": 1, "share": 1
+        }
+    }
+
+    created_roles = []
+    for dt in doc_types:
+        for group, perms in permission_groups.items():
+            role_name = f"{dt}-{group}"
+            
+            if not frappe.db.exists("Role", role_name):
+                role = frappe.get_doc({
+                    "doctype": "Role",
+                    "role_name": role_name,
+                    "desk_access": 1,  # Enable desk access for UI users
+                    "two_factor_auth": 0
+                })
+                role.insert(ignore_permissions=True)
+                created_roles.append(role_name)
+                frappe.msgprint(f"Created role: {role_name}")
+            
+            existing_perm = frappe.get_all("Custom DocPerm", filters={"parent": dt, "role": role_name, "permlevel": 0})
+            if not existing_perm:
+                doc_perm = frappe.get_doc({
+                    "doctype": "Custom DocPerm",
+                    "parent": dt,
+                    "parenttype": "DocType",
+                    "parentfield": "permissions",
+                    "role": role_name,
+                    "permlevel": 0,
+                    **perms
+                })
+                doc_perm.insert(ignore_permissions=True)
+                frappe.msgprint(f"Created doc perm: {role_name} for {dt}")
+            
+            if group in ["FullAccess", "Operator"]:
+                existing_field_perm = frappe.get_all("Custom DocPerm", filters={"parent": dt, "role": role_name, "permlevel": 1})
+                if not existing_field_perm:
+                    field_perm = frappe.get_doc({
+                        "doctype": "Custom DocPerm",
+                        "parent": dt,
+                        "parenttype": "DocType",
+                        "parentfield": "permissions",
+                        "role": role_name,
+                        "permlevel": 1,
+                        "read": 1
+                    })
+                    field_perm.insert(ignore_permissions=True)
+                    frappe.msgprint(f"Created field perm: {role_name} for {dt}")
+
+    frappe.db.commit()
+    frappe.clear_cache()
+    frappe.msgprint(f"Created roles: {', '.join(created_roles)}")
+    frappe.msgprint("Role and permission creation completed!")
+    return True
+
+def delete_module_5roles(modules):
+    """Delete five permission roles and their permissions for specified modules"""
+    if isinstance(modules, str):
+        module_list = [m.strip() for m in modules.split(",") if m.strip()]
+    elif isinstance(modules, list):
+        module_list = [m.strip() for m in modules if m.strip()]
+    else:
+        frappe.log_error("Invalid modules format, expected string or list", "delete_module_5roles")
+        return False
+
+    if not module_list:
+        frappe.log_error("No valid modules provided", "delete_module_5roles")
+        return False
+
+    doc_types = frappe.get_all(
+        "DocType",
+        filters={"module": ["in", module_list], "issingle": 0},
+        fields=["name"]
+    )
+    doc_types = [dt.name for dt in doc_types]
+    if not doc_types:
+        frappe.log_error(f"No document DocType found for modules: {', '.join(module_list)}", "delete_module_5roles")
+        return False
+
+    role_groups = ["FullAccess", "ReadOnly", "Operator", "Importer", "Sharer"]
+    deleted_roles = []
+    for dt in doc_types:
+        for group in role_groups:
+            role_name = f"{dt}-{group}"
+            
+            # Check if role is assigned to any users
+            users_with_role = frappe.get_all("User", filters={"role": role_name}, fields=["name"])
+            if users_with_role:
+                frappe.log_error(f"Role {role_name} is assigned to users: {', '.join(u.name for u in users_with_role)}. Deletion skipped.", "delete_module_5roles")
+                continue
+            
+            frappe.db.delete("Custom DocPerm", {
+                "parent": dt,
+                "role": role_name
+            })
+            
+            if frappe.db.exists("Role", role_name):
+                frappe.db.delete("Role", {"role_name": role_name})
+                deleted_roles.append(role_name)
+                frappe.msgprint(f"Deleted role: {role_name}")
+
+    frappe.db.commit()
+    frappe.clear_cache()
+    frappe.msgprint(f"Deleted roles: {', '.join(deleted_roles)}")
+    frappe.msgprint("Role and permission deletion completed!")
+    return True
+EOF
+
+    # Copy create_permissions.py to container
+    if ! docker cp "${PROJECT_DIR}/create_permissions.py" $(docker compose ${compose_files} --env-file .env ps -q "${service_name}"):"/home/frappe/frappe-bench/apps/${app_name}/${app_name}/module/create_permissions.py" >> "$deploy_log" 2>&1; then
+        error "Failed to copy create_permissions.py to '${app_name}'. Check $deploy_log"
+        echo "[$(date)] Failed to copy create_permissions.py to '${app_name}'" >> "$deploy_log"
+        send_alert "Failed to copy create_permissions.py to ${app_name}. Check $deploy_log"
+        rm -f "${PROJECT_DIR}/create_permissions.py"
+        exit 1
+    fi
+    rm -f "${PROJECT_DIR}/create_permissions.py"
+
+    # Update hooks.py with standard configuration
+    info "Updating hooks.py for '${app_name}'..."
+    echo "[$(date)] Updating hooks.py for '${app_name}'" >> "$deploy_log"
+    if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+        bash -c "cat > /home/frappe/frappe-bench/apps/${app_name}/${app_name}/hooks.py << 'EOF'
+app_name = '${app_name}'
+app_title = 'Custom Batch Role'
+app_publisher = 'Frappe'
+app_description = 'Batch role creation app'
+app_email = 'contact@example.com'
+app_version = '1.0.0'
+app_license = 'MIT'
+EOF" >> "$deploy_log" 2>&1; then
+        error "Failed to update hooks.py for '${app_name}'. Check $deploy_log"
+        echo "[$(date)] Failed to update hooks.py for '${app_name}'" >> "$deploy_log"
+        send_alert "Failed to update hooks.py for ${app_name}. Check $deploy_log"
+        exit 1
+    fi
+
+    # Run bench migrate
+    info "Running bench migrate for '${app_name}'..."
+    echo "[$(date)] Running bench migrate for '${app_name}'" >> "$deploy_log"
+    if ! docker compose ${compose_files} --env-file .env exec -T "${service_name}" \
+        bench --site "${site_name}" migrate >> "$deploy_log" 2>&1; then
+        error "Failed to run bench migrate for '${app_name}'. Check $deploy_log"
+        echo "[$(date)] Failed to run bench migrate for '${app_name}'" >> "$deploy_log"
+        send_alert "Failed to run bench migrate for ${app_name}. Check $deploy_log"
+        exit 1
+    fi
+
+    info "Custom App '${app_name}' setup and registration completed."
+    echo "[$(date)] Custom App '${app_name}' setup and registration completed" >> "$deploy_log"
+}
+
+# ---------- Batch create module 5 roles ----------
+cmd_batch_create_module_5roles() {
+    local modules="${2:-Selling,Buying}"
+    local compose_files
+    compose_files=$(get_compose_files)
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    local site_name="${SITE_NAME}"
+    local app_name="custom_batch_role"
+
+    # Setup Custom App
+    setup_custom_app
+
+    info "Creating 5 roles for modules: ${modules} on site '${site_name}'..."
+    echo "[$(date)] Starting batch_create_module_5roles for modules: ${modules}" >> "$deploy_log"
+
+    # Execute create_module_5roles using bench execute
+    info "Executing create_module_5roles for modules: ${modules}..."
+    echo "[$(date)] Executing create_module_5roles for modules: ${modules}" >> "$deploy_log"
+    if ! docker compose ${compose_files} --env-file .env exec -T backend \
+        bench --site "${site_name}" execute "${app_name}.module.create_permissions.create_module_5roles" --args "[\"${modules}\"]" >> "$deploy_log" 2>&1; then
+        error "Failed to create 5 roles for modules: ${modules}. Check $deploy_log"
+        echo "[$(date)] Failed to create 5 roles for modules: ${modules}" >> "$deploy_log"
+        send_alert "Failed to create 5 roles for modules ${modules} on site '${site_name}'. Check $deploy_log"
+        exit 1
+    fi
+
+    info "Successfully created 5 roles for modules: ${modules}"
+    echo "[$(date)] Successfully created 5 roles for modules: ${modules}" >> "$deploy_log"
+    send_alert "Successfully created 5 roles for modules: ${modules} on site '${site_name}'"
+}
+
+# ---------- Batch delete module 5 roles ----------
+cmd_batch_delete_module_5roles() {
+    local modules="${2:-Selling,Buying}"
+    local compose_files
+    compose_files=$(get_compose_files)
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    local site_name="${SITE_NAME}"
+    local app_name="custom_batch_role"
+
+    # Setup Custom App
+    setup_custom_app
+
+    info "Deleting 5 roles for modules: ${modules} on site '${site_name}'..."
+    echo "[$(date)] Starting batch_delete_module_5roles for modules: ${modules}" >> "$deploy_log"
+
+    # Confirm deletion (dangerous operation)
+    read -p "DANGER: This will DELETE all 5 roles for modules '${modules}' on site '${site_name}'. Continue? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        warn "Batch delete cancelled by user."
+        echo "[$(date)] Batch delete cancelled by user for modules: ${modules}" >> "$deploy_log"
+        send_alert "Batch delete cancelled by user for modules: ${modules} on site '${site_name}'"
+        return 1
+    fi
+
+    # Execute delete_module_5roles using bench execute
+    info "Executing delete_module_5roles for modules: ${modules}..."
+    echo "[$(date)] Executing delete_module_5roles for modules: ${modules}" >> "$deploy_log"
+    if ! docker compose ${compose_files} --env-file .env exec -T backend \
+        bench --site "${site_name}" execute "${app_name}.module.create_permissions.delete_module_5roles" --args "[\"${modules}\"]" >> "$deploy_log" 2>&1; then
+        error "Failed to delete 5 roles for modules: ${modules}. Check $deploy_log"
+        echo "[$(date)] Failed to delete 5 roles for modules: ${modules}" >> "$deploy_log"
+        send_alert "Failed to delete 5 roles for modules ${modules} on site '${site_name}'. Check $deploy_log"
+        exit 1
+    fi
+
+    info "Successfully deleted 5 roles for modules: ${modules}"
+    echo "[$(date)] Successfully deleted 5 roles for modules: ${modules}" >> "$deploy_log"
+    send_alert "Successfully deleted 5 roles for modules: ${modules} on site '${site_name}'"
+}
+
+cmd_fix_routing() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    info "Restarting frontend/websocket/nginx to refresh routing"
+    docker compose ${compose_files} --env-file .env restart frontend websocket || true
+}
+cmd_fix_configurator() {
+    local compose_files
+    compose_files=$(get_compose_files)
+    info "Re-running configurator"
+    docker compose ${compose_files} --env-file .env run --rm configurator || true
+}
+cmd_check_mysql_user(){
+    check_mysql_user
+}
+
+# Enhanced quick rebuild with cache heuristics and bench doctor verification
+cmd_quick_rebuild() {
+    local force=false
+    local no_pull=false
+    shift || true
+    while [[ $# -gt 0 && $1 == --* ]]; do
+        case $1 in
+            --force)
+                force=true; shift ;;
+            --no-pull)
+                no_pull=true; shift ;;
+            *) break ;;
+        esac
+    done
+
+    check_required_files
+
+    local use_cache=true
+    if docker image inspect "${CUSTOM_IMAGE}" >/dev/null 2>&1; then
+        if ! is_build_complete; then
+            use_cache=false
+            warn "Previous build incomplete (missing apps), forcing full rebuild"
+        fi
+    else
+        use_cache=false
+        info "No existing image found, full rebuild required"
+    fi
+
+    if [ "$force" = true ]; then
+        use_cache=false
+        info "Force flag set, full rebuild"
+    fi
+
+    info "Quick rebuild: use_cache=${use_cache}, no_pull=${no_pull}"
+
+    generate_custom_dockerfile
+
+    local build_opts=()
+    [ "$use_cache" = false ] && build_opts+=(--no-cache)
+    [ "$no_pull" = false ] && build_opts+=(--pull)
+    # Add memory limit to avoid OOM (4GB for build)
+    build_opts+=(--memory 4g)
+
+    if ! docker build "${build_opts[@]}" --build-arg ERPNEXT_VERSION="${BASE_TAG}" -t "${CUSTOM_IMAGE}:${CUSTOM_TAG}" -f Dockerfile.custom .; then
+        error "Custom image build failed. Check logs for bench get-app or bench build errors."
+        exit 1
+    fi
+
+    info "Built image: ${CUSTOM_IMAGE}:${CUSTOM_TAG}"
+
+    # persist CUSTOM_IMAGE/CUSTOM_TAG in .env
+    if grep -q '^CUSTOM_IMAGE=' "$ENV_FILE"; then
+        sed -i "s|^CUSTOM_IMAGE=.*|CUSTOM_IMAGE=${CUSTOM_IMAGE}|" "$ENV_FILE"
+    else
+        echo "CUSTOM_IMAGE=${CUSTOM_IMAGE}" >> "$ENV_FILE"
+    fi
+    if grep -q '^CUSTOM_TAG=' "$ENV_FILE"; then
+        sed -i "s|^CUSTOM_TAG=.*|CUSTOM_TAG=${CUSTOM_TAG}|" "$ENV_FILE"
+    else
+        echo "CUSTOM_TAG=${CUSTOM_TAG}" >> "$ENV_FILE"
+    fi
+
+    # Run bench doctor inside the image to validate completeness
+    info "Running bench doctor inside the new image to validate build..."
+    local cid
+    cid=$(docker create "${CUSTOM_IMAGE}:${CUSTOM_TAG}" bash -lc "bench doctor > /tmp/doctor.log 2>&1; echo \$? > /tmp/_doctor_exit")
+    docker start -a "$cid" >/dev/null || true
+    docker cp "$cid":/tmp/doctor.log ./doctor_${CUSTOM_TAG}.log || true
+    docker cp "$cid":/tmp/_doctor_exit ./_doctor_exit || true
+    docker rm "$cid" >/dev/null || true
+    local doctor_exit=1
+    if [ -f ./_doctor_exit ]; then
+        doctor_exit=$(cat ./_doctor_exit 2>/dev/null || echo 1)
+        rm -f ./_doctor_exit
+    fi
+
+    if [ "$doctor_exit" -ne 0 ]; then
+        warn "bench doctor detected issues (exit=${doctor_exit}). See ./doctor_${CUSTOM_TAG}.log"
+        warn "Consider re-running quick-rebuild --force to do a no-cache rebuild, or inspect the doctor log."
+        # optional: fail the overall operation or continue. We'll continue but notify user.
+    else
+        info "bench doctor passed ✅"
+        rm -f ./doctor_${CUSTOM_TAG}.log || true
+    fi
+
+    local compose_files
+    compose_files=$(get_compose_files)
+    info "Bringing up services..."
+    docker compose ${compose_files} --env-file .env up -d --remove-orphans
+    check_mysql_user
+    info "Quick rebuild and start completed"
+}
+
+# New: Standalone health check command
+cmd_health_check() {
+    local site_name="${2:-${SITE_NAME}}"
+    local strict_mode=false
+    local log_file="${3:-${PROJECT_DIR}/health_check.log}"
+
+    if [[ "${1:-}" == "--strict" ]]; then
+        strict_mode=true
+        shift
+    fi
+
+    check_required_files
+    if verify_site_health "$site_name" --strict="$strict_mode" --log-file "$log_file"; then
+        info "Health check completed successfully."
+        exit 0
+    else
+        error "Health check failed."
+        exit 1
+    fi
+}
+
+# ---------- Upgrade stack ----------
+cmd_upgrade() {
+    local deploy_log="${PROJECT_DIR}/deploy.log"
+    echo "[$(date)] Starting upgrade process for site '${SITE_NAME}'" >> "$deploy_log"
+
+    # Check required files
+    check_required_files
+
+    # Confirm before proceeding
+    read -p "WARNING: This will rebuild the custom image and upgrade site '${SITE_NAME}'. Continue? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        warn "Upgrade cancelled by user."
+        echo "[$(date)] Upgrade cancelled by user" >> "$deploy_log"
+        return 1
+    fi
+
+    # Step 1: Check app versions
+    if ! check_app_versions; then
+        info "No version updates required, skipping build and deploy."
+        echo "[$(date)] No version updates required for site '${SITE_NAME}'" >> "$deploy_log"
+        return 0
+    fi
+
+    # Step 2: Build custom image
+    info "Building custom image for upgrade..."
+    cmd_build_custom_image
+    if [ $? -ne 0 ]; then
+        error "Custom image build failed - aborting upgrade. Check $deploy_log"
+        exit 1
+    fi
+
+    # Step 3: Deploy with update
+    info "Deploying and upgrading site '${SITE_NAME}'..."
+    cmd_deploy
+    if [ $? -ne 0 ]; then
+        error "Deployment/upgrade failed - check $deploy_log"
+        exit 1
+    fi
+
+    info "Upgrade completed successfully - site '${SITE_NAME}' is updated ✅"
+    echo "[$(date)] Upgrade successful for site '${SITE_NAME}'" >> "$deploy_log"
+}
+
+# ---------- CLI dispatch ----------
+case "${1:-}" in
+    deploy)            cmd_deploy ;;
+    build-custom-image)cmd_build_custom_image ;;
+    start)             cmd_start ;;
+    stop)              cmd_stop ;;
+    restart)           cmd_restart ;;
+    logs)              cmd_logs "${@}" ;;
+    status)            cmd_status ;;
+    cleanup)           cmd_cleanup ;;
+    force-cleanup)     cmd_force_cleanup ;;
+    rebuild-and-deploy)cmd_rebuild_and_deploy ;;
+    redeploy)          cmd_redeploy ;;
+    fix-routing)       cmd_fix_routing ;;
+    fix-configurator)  cmd_fix_configurator ;;
+    check_mysql_user)  cmd_check_mysql_user ;;
+    quick-rebuild)     cmd_quick_rebuild "${@}" ;;
+    health-check)      cmd_health_check "${@}" ;;
+    backup)            cmd_backup ;;
+    restore-backup)    cmd_restore_backup "${@}" ;;
+    verify_site_health) verify_site_health "$@" ;;
+    upgrade)           cmd_upgrade ;;
+    get_latest_version) auto_detect_app_versions "$@" ;;
+    get_dockerhub_tag) shift; get_dockerhub_tag "$@" ;;
+    batch_create_module_5roles) cmd_batch_create_module_5roles "${@}" ;;
+    batch_delete_module_5roles) cmd_batch_delete_module_5roles "${@}" ;;
+    *)
+        cat <<USAGE
+Usage: $0 {deploy|build-custom-image|start|stop|restart|
+    restore-backup|logs|status|cleanup|force-cleanup|get_dockerhub_tag|
+    rebuild-and-deploy|redeploy|fix-routing|fix-configurator|
+    check_mysql_user|quick-rebuild|health-check|upgrade|get_latest_version|
+    batch_create_module_5roles|batch_delete_module_5roles}
+
+Notes:
+ - Use --debug as first argument to print loaded env variables.
+ - quick-rebuild [--force|--no-pull]: Enhanced rebuild with cache retention; forces no-cache if incomplete or --force; --no-pull skips base image pull.
+ - health-check [--strict] [SITE_NAME] [LOG_FILE]: Run standalone site health check (apps, scheduler, assets, DB). Use --strict for production monitoring (exits 1 on failure).
+ - upgrade: Rebuilds custom image and upgrades the site with data migration, only if app versions differ from .env.
+ - batch_create_module_5roles [MODULES]: Create 5 roles (FullAccess, ReadOnly, Operator, Importer, Sharer) for specified modules (default: Selling,Buying).
+ - batch_delete_module_5roles [MODULES]: Delete 5 roles for specified modules (default: Selling,Buying).
+ - To fully reset DB/volumes in dev: $0 force-cleanup
+ - Make sure .env contains MYSQL_ROOT_PASSWORD and DB_PASSWORD
+USAGE
+        exit 1
+        ;;
+esac
